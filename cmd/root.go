@@ -42,8 +42,10 @@ func init() {
 	rootCmd.AddCommand(sessionCmd)
 	rootCmd.AddCommand(billCmd)
 	rootCmd.AddCommand(whipCmd)
+	rootCmd.AddCommand(speakerCmd)
 	rootCmd.AddCommand(cabinetCmd)
 	rootCmd.AddCommand(floorCmd)
 	rootCmd.AddCommand(gazetteCmd)
 	rootCmd.AddCommand(hansardCmd)
+	rootCmd.AddCommand(projectCmd)
 }
