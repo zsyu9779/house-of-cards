@@ -4,54 +4,64 @@
 
 ## 项目状态
 
-- **阶段**: Phase 3 ✅ 完成
-- **目标**: 崩溃恢复 + Speaker AI + Hansard 记录系统
+- **阶段**: v0.2 Phase 1 全部完成 + 巡检修复完成（2026-03-08），待开始 Phase 2
+- **目标**: 下一步 Phase 2 — A-1 CLAUDE.md + B-1 Gazette+ACK 协议
 
-## 当前状态
+## 最近工作
 
-Phase 3 所有子项已完成并验证：
+### Phase 1 巡检修复（2026-03-08）
 
-- [x] `internal/speaker/speaker.go` — Speaker 包（GenerateContext + WriteContext + Summon）
-- [x] `hoc speaker summon` — 刷新 context.md + 启动 Claude 作为 Speaker（tmux/前台）
-- [x] `hoc speaker context [--refresh]` — 查看/刷新议长备忘录
-- [x] `internal/whip/whip.go` — By-election 补选流程（git stash + Handoff Gazette + Hansard + 重置议案）
-- [x] Whip `hansardUpdate` 每 60 秒自动刷新 speaker/context.md
-- [x] `hoc bill enacted [id]` — 标记通过 + 写 Hansard + 创建 completion Gazette
-- [x] `hoc hansard [minister-id]` — 部长履历（含成功率）
-- [x] `hoc hansard list` — 全量议事录
-- [x] `hoc minister by-election [id]` — 手动触发补选
-- [x] `internal/store/store.go` — ListHansard/ListHansardByMinister/GetBillsByAssignee/ClearBillAssignment/HansardSuccessRate/ListMinistersWithStatus
+对照 `docs/v0.2-feature-spec.md` + `docs/v0.2/` 草案巡检，发现并修复 3 个问题：
 
-## 本次改动
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 (Critical) | RecordEvent 全项目零调用 | 在 6 个文件追加 19 处调用，覆盖 Spec 列出的全部 16 个 topic |
+| 2 (Medium) | session open 缺 `--force` | 添加 `--force` flag + 校验跳过逻辑 |
+| 3 (Low) | serve.go 未集成校验 | 确认当前无 bill 创建 API，属"未来端点"，暂不改 |
 
-1. `internal/store/store.go` — 6 个新方法
-2. `internal/speaker/speaker.go` — 新建 Speaker 包
-3. `internal/whip/whip.go` — 增加 hocDir 字段 + byElection() + hansardUpdate 刷新 context.md
-4. `cmd/hansard.go` — 完整实现
-5. `cmd/bill.go` — 新增 bill enacted 命令
-6. `cmd/ministers.go` — 新增 minister by-election 命令
-7. `cmd/speaker.go` — 新建，speaker summon/context 命令
-8. `cmd/root.go` — 注册 speakerCmd
+RecordEvent 调用分布：
+- `liveness.go`(3): minister.stuck, by_election.triggered/completed
+- `scheduler.go`(7): bill.assigned, session.completed(x2), privy.merge_success/conflict, autoscale.triggered(x2)
+- `poller.go`(3): bill.enacted, committee.assigned/result
+- `dispatch.go`(2): gazette.delivered (tmux + inbox)
+- `cmd/bill.go`(1): bill.created
+- `cmd/session.go`(1): bill.created
 
-## 验证结果（端到端测试）
+### v0.2 Phase 1 全部完成（2026-03-08）
 
-- `hoc bill enacted` → 写 Hansard + completion Gazette ✅
-- `hoc hansard go-minister` → 成功率 1/1 (100%) ✅
-- `hoc minister by-election react-minister` → offline + bill→draft + Hansard(failed) ✅
-- `hoc speaker context --refresh` → 生成完整政府备忘录 ✅
-- Whip threeLineWhip 自动检测 stuck → byElection ✅
+| Feature | 编号 | 状态 |
+|---------|------|------|
+| 统一事件表 | D-1 | ✅ 完成（含 19 处 RecordEvent 埋点） |
+| Bill 入口校验 | D-2 | ✅ 完成（bill draft + session open 均支持 --force） |
+| GitHub Actions CI | E-1 | ✅ 完成 |
+| Whip 子模块拆分 | C-1 | ✅ 完成（6 文件） |
 
-## 下一步 (Phase 4)
+### 更早的工作（已归档）
 
-- [ ] `hoc floor` TUI — BubbleTea 实时监控界面
-- [ ] Pipeline / Tree / Mesh 拓扑引擎扩展
-- [ ] Committee 审查流程（review Gazette → committee 状态）
-- [ ] Privy Council：并行 Bills enacted 后自动 git merge
-- [ ] `hoc cabinet list/reshuffle` 完整实现
-- [ ] Codex / Cursor runtime 接入（多 runtime 支持）
+- v0.2 Feature 规格文档整合定稿
+- 巡检修复 6 任务全部 PASS，覆盖率 31.6% -> 40.3%
+- v0.2 总体草案、v0.1 文档归档
 
-## 已知问题 / 待决策
+## v0.2 实施路线进度
 
-- `minister summon --bill` 需要项目已 `hoc project add`
-- Speaker prompt 中 `{{include: ...}}` 是模板语法占位，claude CLI 不支持，需改为直接嵌入 context 内容
-- Privy Council 未实现（并行 Bills 完成后无自动合并）
+| Phase | 内容 | 状态 |
+|-------|------|------|
+| **Phase 1** | D-1 事件表 + D-2 入口校验 + E-1 CI + C-1 Whip 拆分 | **✅ 完成** |
+| Phase 2 | A-1 CLAUDE.md + B-1 Gazette+ACK + C-1 测试补强 | 待开始 |
+| Phase 3 | A-2 Autoscale + A-3 API + B-2/B-3 + D-3 治理 + E-2 | 待开始 |
+| Phase 4 | C-2 Doctor + C-3 回放 + E-3/E-4 + 质询度量 | 待开始 |
+
+## 待解决问题
+
+| 问题 | 说明 | 优先级 |
+|------|------|--------|
+| serve.go bill 创建 API 校验 | 当前无 bill 创建端点，A-3 实施时集成 | P1 |
+| whip tick/threeLineWhip 测试 | 依赖真实 tmux/PID | P2 |
+| privy AnalyzeBranch 测试 | 需更复杂 git 分叉场景 | P2 |
+
+## 下一步候选
+
+1. **开始 Phase 2**：A-1 Minister CLAUDE.md 写入 + B-1 Gazette 结构化 + ACK 协议
+2. B-1 分 3 步：Step 1 结构化 payload → Step 2 ACK 基础设施 → Step 3 Question Time
+
+---

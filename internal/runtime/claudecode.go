@@ -1,11 +1,14 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/house-of-cards/hoc/internal/otel"
 )
 
 // ClaudeCodeRuntime implements Runtime for the claude-code CLI.
@@ -27,6 +30,14 @@ func NewClaudeCodeRuntime(useTmux bool) *ClaudeCodeRuntime {
 
 // Summon writes the bill brief into the chamber and starts the claude process.
 func (r *ClaudeCodeRuntime) Summon(opts SummonOpts) (*AgentSession, error) {
+	tracer := otel.GlobalTracer("runtime.claude")
+	_, span := tracer.Start(context.Background(), "minister.summon")
+	defer span.End()
+	span.SetAttr("minister_id", opts.MinisterID)
+	span.SetAttr("use_tmux", r.UseTmux)
+
+	otel.Metrics().Counter("hoc_ministers_active_total").Inc()
+
 	// Write bill brief into chamber's .hoc directory.
 	briefDir := filepath.Join(opts.ChamberPath, ".hoc")
 	if err := os.MkdirAll(briefDir, 0755); err != nil {
@@ -76,45 +87,15 @@ func (r *ClaudeCodeRuntime) Summon(opts SummonOpts) (*AgentSession, error) {
 
 // IsSeated returns true if the session process is still running.
 func (r *ClaudeCodeRuntime) IsSeated(session *AgentSession) bool {
-	if session.TmuxSession != "" {
-		err := exec.Command("tmux", "has-session", "-t", session.TmuxSession).Run()
-		return err == nil
-	}
-	if session.PID > 0 {
-		// kill -0 checks process existence without sending a signal.
-		err := exec.Command("kill", "-0", fmt.Sprintf("%d", session.PID)).Run()
-		return err == nil
-	}
-	return false
+	return sessionIsSeated(session)
 }
 
 // Dismiss kills the session.
 func (r *ClaudeCodeRuntime) Dismiss(session *AgentSession) error {
-	if session.TmuxSession != "" {
-		cmd := exec.Command("tmux", "kill-session", "-t", session.TmuxSession)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("kill tmux session: %w\n%s", err, string(output))
-		}
-		return nil
-	}
-	if session.PID > 0 {
-		proc, err := os.FindProcess(session.PID)
-		if err != nil {
-			return fmt.Errorf("find process: %w", err)
-		}
-		return proc.Signal(os.Interrupt)
-	}
-	return nil
+	return sessionDismiss(session)
 }
 
 // Dispatch sends a message to a running tmux session.
 func (r *ClaudeCodeRuntime) Dispatch(session *AgentSession, message string) error {
-	if session.TmuxSession == "" {
-		return fmt.Errorf("dispatch only supported for tmux sessions")
-	}
-	cmd := exec.Command("tmux", "send-keys", "-t", session.TmuxSession, message, "Enter")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("dispatch: %w\n%s", err, string(output))
-	}
-	return nil
+	return sessionDispatch(session, message)
 }

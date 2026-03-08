@@ -3,11 +3,12 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/house-of-cards/hoc/internal/store"
+	"github.com/house-of-cards/hoc/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -27,16 +28,26 @@ func init() {
 	billCmd.AddCommand(billDraftCmd)
 	billCmd.AddCommand(billAssignCmd)
 	billCmd.AddCommand(billEnactedCmd)
+	billCmd.AddCommand(billCommitteeCmd)
+	billCmd.AddCommand(billReviewCmd)
+
+	billListCmd.Flags().Bool("json", false, "以 JSON 格式输出")
 
 	billDraftCmd.Flags().String("title", "", "议案标题 (必填)")
 	billDraftCmd.Flags().String("session", "", "所属会期 ID")
 	billDraftCmd.Flags().String("motion", "", "议案指示（描述需要做什么）")
 	billDraftCmd.Flags().String("portfolio", "", "所需技能（如 go,react）")
+	billDraftCmd.Flags().Bool("force", false, "跳过标题校验")
 	_ = billDraftCmd.MarkFlagRequired("title")
 
 	billEnactedCmd.Flags().Float64("quality", 0, "质量评分 (0.0-1.0)")
 	billEnactedCmd.Flags().String("notes", "", "备注（委员会意见等）")
 	billEnactedCmd.Flags().Int("duration", 0, "耗时（秒）")
+
+	billReviewCmd.Flags().Bool("pass", false, "审查通过（committee → enacted）")
+	billReviewCmd.Flags().Bool("fail", false, "审查未通过（committee → reading，退回修改）")
+	billReviewCmd.Flags().String("notes", "", "委员会审查意见")
+	billReviewCmd.Flags().Float64("quality", 0, "质量评分 (0.0-1.0)")
 }
 
 var billListCmd = &cobra.Command{
@@ -51,6 +62,34 @@ var billListCmd = &cobra.Command{
 		bills, err := db.ListBills()
 		if err != nil {
 			return fmt.Errorf("list bills: %w", err)
+		}
+
+		jsonMode, _ := cmd.Flags().GetBool("json")
+		if jsonMode {
+			type billJSON struct {
+				ID        string `json:"id"`
+				Title     string `json:"title"`
+				Status    string `json:"status"`
+				Assignee  string `json:"assignee"`
+				Session   string `json:"session_id"`
+				Branch    string `json:"branch"`
+				Portfolio string `json:"portfolio"`
+			}
+			out := make([]billJSON, 0, len(bills))
+			for _, b := range bills {
+				out = append(out, billJSON{
+					ID:        b.ID,
+					Title:     b.Title,
+					Status:    b.Status,
+					Assignee:  b.Assignee.String,
+					Session:   b.SessionID.String,
+					Branch:    b.Branch.String,
+					Portfolio: b.Portfolio.String,
+				})
+			}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
 		}
 
 		if len(bills) == 0 {
@@ -113,6 +152,11 @@ var billShowCmd = &cobra.Command{
 			fmt.Printf("\n依赖:\n%s\n", b.DependsOn.String)
 		}
 
+		// Show complexity estimate.
+		complexity, conf := util.EstimateBillComplexity(b.Title, b.Description.String)
+		fmt.Printf("\n复杂度预测:  %s %s (%.0f%% 置信度)\n",
+			util.ComplexityIcon(complexity), complexity, conf*100)
+
 		// Show gazettes for this bill.
 		gazettes, err := db.ListGazettesForBill(b.ID)
 		if err == nil && len(gazettes) > 0 {
@@ -143,6 +187,14 @@ var billDraftCmd = &cobra.Command{
 		sessionID, _ := cmd.Flags().GetString("session")
 		motion, _ := cmd.Flags().GetString("motion")
 
+		// D-2: Input Guard
+		force, _ := cmd.Flags().GetBool("force")
+		if !force {
+			if err := store.ValidateBillTitle(title); err != nil {
+				return fmt.Errorf("议案标题校验失败: %w\n使用 --force 跳过校验", err)
+			}
+		}
+
 		billID := shortID("bill")
 
 		bill := &store.Bill{
@@ -157,6 +209,7 @@ var billDraftCmd = &cobra.Command{
 		if err := db.CreateBill(bill); err != nil {
 			return fmt.Errorf("create bill: %w", err)
 		}
+		_ = db.RecordEvent("bill.created", "cli", billID, "", bill.SessionID.String, "")
 
 		fmt.Printf("📄 议案已起草\n")
 		fmt.Printf("   ID:    %s\n", billID)
@@ -205,8 +258,7 @@ var billAssignCmd = &cobra.Command{
 		// Record branch name.
 		branch := fmt.Sprintf("minister/%s", ministerID)
 		if err := db.UpdateBillBranch(billID, branch); err != nil {
-			// Non-fatal.
-			fmt.Fprintf(os.Stderr, "warning: could not update branch: %v\n", err)
+			slog.Warn("could not update branch", "err", err)
 		}
 
 		fmt.Printf("✓ 议案 [%s] %s 已分配给 %s\n", billID, b.Title, m.Title)
@@ -220,11 +272,11 @@ var billAssignCmd = &cobra.Command{
 		summary := fmt.Sprintf("议案 [%s] \"%s\" 已由议长分配给 %s，进入一读阶段。",
 			billID, b.Title, m.Title)
 		g := &store.Gazette{
-			ID:           gazetteID,
-			ToMinister:   store.NullString(ministerID),
-			BillID:       store.NullString(billID),
-			Type:         store.NullString("handoff"),
-			Summary:      summary,
+			ID:         gazetteID,
+			ToMinister: store.NullString(ministerID),
+			BillID:     store.NullString(billID),
+			Type:       store.NullString("handoff"),
+			Summary:    summary,
 		}
 		_ = db.CreateGazette(g)
 
@@ -276,7 +328,7 @@ var billEnactedCmd = &cobra.Command{
 				Notes:      store.NullString(notes),
 			}
 			if err := db.CreateHansard(h); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: create hansard: %v\n", err)
+				slog.Warn("create hansard", "err", err)
 			}
 		}
 
@@ -305,6 +357,164 @@ var billEnactedCmd = &cobra.Command{
 	},
 }
 
+var billCommitteeCmd = &cobra.Command{
+	Use:   "committee [bill-id]",
+	Short: "提交议案至委员会审查（reading → committee）",
+	Long: `部长完成工作后，将议案提交至委员会审查。
+状态转换：reading → committee
+
+审查完成后，使用 hoc bill review <id> --pass/--fail 记录审查结论。`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		billID := args[0]
+		b, err := db.GetBill(billID)
+		if err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if b.Status != "reading" && b.Status != "draft" {
+			return fmt.Errorf("议案当前状态为 [%s]，只有 reading/draft 状态的议案可提交委员会", b.Status)
+		}
+
+		if err := db.UpdateBillStatus(billID, "committee"); err != nil {
+			return fmt.Errorf("update bill status: %w", err)
+		}
+
+		// Create a gazette announcing the committee review.
+		ministerID := b.Assignee.String
+		summary := fmt.Sprintf("议案 [%s] \"%s\" 已提交委员会审查。部长: %s",
+			billID, b.Title, orDash(ministerID))
+		g := &store.Gazette{
+			ID:           shortID("gazette"),
+			FromMinister: store.NullString(ministerID),
+			BillID:       store.NullString(billID),
+			Type:         store.NullString("review"),
+			Summary:      summary,
+		}
+		_ = db.CreateGazette(g)
+
+		fmt.Printf("📋 议案 [%s] \"%s\" 已提交委员会\n", billID, b.Title)
+		fmt.Printf("   状态: %s → committee\n", b.Status)
+		fmt.Printf("\n委员会审查后，运行:\n")
+		fmt.Printf("  hoc bill review %s --pass              # 通过\n", billID)
+		fmt.Printf("  hoc bill review %s --fail --notes \"...\" # 退回\n", billID)
+		return nil
+	},
+}
+
+var billReviewCmd = &cobra.Command{
+	Use:   "review [bill-id]",
+	Short: "委员会审查结论（committee → enacted 或 → reading）",
+	Long: `记录委员会对议案的审查结论：
+  --pass  审查通过 → 状态变为 enacted
+  --fail  审查未通过 → 状态退回为 reading（请部长修改后再次提交）`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		billID := args[0]
+		pass, _ := cmd.Flags().GetBool("pass")
+		fail, _ := cmd.Flags().GetBool("fail")
+		notes, _ := cmd.Flags().GetString("notes")
+		quality, _ := cmd.Flags().GetFloat64("quality")
+
+		if !pass && !fail {
+			return fmt.Errorf("必须指定 --pass 或 --fail")
+		}
+		if pass && fail {
+			return fmt.Errorf("--pass 和 --fail 不能同时使用")
+		}
+
+		b, err := db.GetBill(billID)
+		if err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if b.Status != "committee" {
+			return fmt.Errorf("议案当前状态为 [%s]，只有 committee 状态的议案可接受审查结论", b.Status)
+		}
+
+		ministerID := b.Assignee.String
+
+		if pass {
+			// Committee approved: enacted.
+			if err := db.UpdateBillStatus(billID, "enacted"); err != nil {
+				return fmt.Errorf("update bill status: %w", err)
+			}
+
+			// Write Hansard entry.
+			if ministerID != "" {
+				h := &store.Hansard{
+					ID:         shortID("hansard"),
+					MinisterID: ministerID,
+					BillID:     billID,
+					Outcome:    store.NullString("enacted"),
+					Quality:    quality,
+					Notes:      store.NullString(notes),
+				}
+				_ = db.CreateHansard(h)
+			}
+
+			// Create Review Gazette (pass).
+			summary := fmt.Sprintf("委员会审查通过：议案 [%s] \"%s\" 已 Enacted。", billID, b.Title)
+			if notes != "" {
+				summary += "\n审查意见：" + notes
+			}
+			if quality > 0 {
+				summary += fmt.Sprintf("\n质量评分：%.2f", quality)
+			}
+			g := &store.Gazette{
+				ID:         shortID("gazette"),
+				ToMinister: store.NullString(ministerID),
+				BillID:     store.NullString(billID),
+				Type:       store.NullString("review"),
+				Summary:    summary,
+			}
+			_ = db.CreateGazette(g)
+
+			fmt.Printf("✅ 委员会审查通过：议案 [%s] \"%s\"\n", billID, b.Title)
+			fmt.Printf("   状态: committee → enacted\n")
+			if quality > 0 {
+				fmt.Printf("   质量评分: %.2f\n", quality)
+			}
+		} else {
+			// Committee rejected: back to reading.
+			if err := db.UpdateBillStatus(billID, "reading"); err != nil {
+				return fmt.Errorf("update bill status: %w", err)
+			}
+
+			// Create Review Gazette (reject).
+			summary := fmt.Sprintf("委员会审查未通过：议案 [%s] \"%s\" 退回修改。", billID, b.Title)
+			if notes != "" {
+				summary += "\n退回理由：" + notes
+			}
+			g := &store.Gazette{
+				ID:         shortID("gazette"),
+				ToMinister: store.NullString(ministerID),
+				BillID:     store.NullString(billID),
+				Type:       store.NullString("review"),
+				Summary:    summary,
+			}
+			_ = db.CreateGazette(g)
+
+			fmt.Printf("🔄 委员会审查退回：议案 [%s] \"%s\"\n", billID, b.Title)
+			fmt.Printf("   状态: committee → reading（请部长修改后重新提交）\n")
+			if notes != "" {
+				fmt.Printf("   退回理由: %s\n", notes)
+			}
+		}
+		return nil
+	},
+}
+
 // Add a helper to print billspec depends in readable format.
 func dependsOnStr(raw string) string {
 	if raw == "" || raw == "[]" {
@@ -315,19 +525,4 @@ func dependsOnStr(raw string) string {
 		return raw
 	}
 	return strings.Join(deps, ", ")
-}
-
-func orDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max-3]) + "..."
 }

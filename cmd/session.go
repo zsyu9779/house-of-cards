@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/house-of-cards/hoc/internal/store"
+	"github.com/house-of-cards/hoc/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -34,6 +36,8 @@ type sessionSpec struct {
 type sessionMeta struct {
 	Title    string `toml:"title"`
 	Topology string `toml:"topology"`
+	Project  string `toml:"project"`  // Legacy: single project
+	Projects string `toml:"projects"` // Multi-project: comma-separated list
 }
 
 type billSpec struct {
@@ -41,6 +45,7 @@ type billSpec struct {
 	Title     string   `toml:"title"`
 	Motion    string   `toml:"motion"`
 	Portfolio string   `toml:"portfolio"`
+	Project   string   `toml:"project"` // Optional: specific project for this bill
 	DependsOn []string `toml:"depends_on"`
 }
 
@@ -58,6 +63,18 @@ func init() {
 	sessionCmd.AddCommand(sessionOpenCmd)
 	sessionCmd.AddCommand(sessionStatusCmd)
 	sessionCmd.AddCommand(sessionDissolveCmd)
+	sessionCmd.AddCommand(sessionMigrateCmd) // Phase 3E
+	sessionCmd.AddCommand(sessionStatsCmd)   // Phase 5A
+
+	sessionOpenCmd.Flags().String("project", "", "单个项目名称（已废弃，使用 --projects）")
+	sessionOpenCmd.Flags().String("projects", "", "项目列表，逗号分隔（用于多项目会期）")
+	sessionOpenCmd.Flags().Bool("force", false, "跳过议案标题校验")
+	sessionStatusCmd.Flags().Bool("json", false, "以 JSON 格式输出")
+
+	sessionMigrateCmd.Flags().String("project", "", "迁移时使用的默认项目名称")
+	sessionMigrateCmd.Flags().Bool("confirm", false, "执行迁移（默认为预演模式）")
+
+	sessionStatsCmd.Flags().Bool("all", false, "显示所有会期的汇总统计")
 }
 
 var sessionOpenCmd = &cobra.Command{
@@ -89,6 +106,35 @@ var sessionOpenCmd = &cobra.Command{
 			spec.Session.Topology = "parallel"
 		}
 
+		// --projects flag (comma-separated) overrides TOML project field.
+		projectsFlag, _ := cmd.Flags().GetString("projects")
+		projectFlag, _ := cmd.Flags().GetString("project")
+
+		// Build projects JSON array.
+		var projectsJSON string
+		if projectsFlag != "" {
+			// Split by comma and build JSON array.
+			projects := strings.Split(projectsFlag, ",")
+			for i := range projects {
+				projects[i] = strings.TrimSpace(projects[i])
+			}
+			b, _ := json.Marshal(projects)
+			projectsJSON = string(b)
+		} else if projectFlag != "" {
+			// Legacy single project support.
+			projectsJSON = `["` + projectFlag + `"]`
+		}
+
+		// D-2: Input Guard - validate bill titles
+		force, _ := cmd.Flags().GetBool("force")
+		if !force {
+			for _, bs := range spec.Bills {
+				if err := store.ValidateBillTitle(bs.Title); err != nil {
+					return fmt.Errorf("议案 [%s] 标题校验失败: %w\n使用 --force 跳过校验", bs.ID, err)
+				}
+			}
+		}
+
 		// Generate session ID.
 		sid := shortID("session")
 
@@ -97,6 +143,8 @@ var sessionOpenCmd = &cobra.Command{
 			ID:       sid,
 			Title:    spec.Session.Title,
 			Topology: spec.Session.Topology,
+			Project:  store.NullString(projectFlag),
+			Projects: store.NullString(projectsJSON),
 			Status:   "active",
 		}
 		if err := db.CreateSession(sess); err != nil {
@@ -107,6 +155,10 @@ var sessionOpenCmd = &cobra.Command{
 		fmt.Printf("   ID:       %s\n", sid)
 		fmt.Printf("   标题:     %s\n", spec.Session.Title)
 		fmt.Printf("   拓扑:     %s\n", spec.Session.Topology)
+		if projectsJSON != "" && projectsJSON != "[]" {
+			projects := sess.GetProjectsSlice()
+			fmt.Printf("   项目:     %v\n", projects)
+		}
 		fmt.Printf("   议案数:   %d\n\n", len(spec.Bills))
 
 		// Derive a short prefix from the session ID hex (after "session-").
@@ -152,15 +204,20 @@ var sessionOpenCmd = &cobra.Command{
 				Status:      "draft",
 				DependsOn:   store.NullString(dependsJSON),
 				Portfolio:   store.NullString(bs.Portfolio),
+				Project:     store.NullString(bs.Project),
 			}
 			if err := db.CreateBill(bill); err != nil {
 				return fmt.Errorf("create bill %s: %w", bs.ID, err)
 			}
-			portfolioNote := ""
+			_ = db.RecordEvent("bill.created", "cli", billID, "", sid, "")
+			notes := ""
 			if bs.Portfolio != "" {
-				portfolioNote = fmt.Sprintf(" [portfolio: %s]", bs.Portfolio)
+				notes = fmt.Sprintf(" [portfolio: %s]", bs.Portfolio)
 			}
-			fmt.Printf("   📄 [%s] %s%s\n", billID, bs.Title, portfolioNote)
+			if bs.Project != "" {
+				notes += fmt.Sprintf(" [project: %s]", bs.Project)
+			}
+			fmt.Printf("   📄 [%s] %s%s\n", billID, bs.Title, notes)
 		}
 
 		fmt.Printf("\n使用 `hoc bill list` 查看议案，`hoc bill assign <id> <minister>` 分配议案。\n")
@@ -169,17 +226,30 @@ var sessionOpenCmd = &cobra.Command{
 }
 
 var sessionStatusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "查看所有会期状态",
+	Use:   "status [session-id]",
+	Short: "查看会期状态（可附带 ID 显示 DAG）",
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := initDB(); err != nil {
 			return err
 		}
 		defer db.Close()
 
+		jsonMode, _ := cmd.Flags().GetBool("json")
+
+		// Single session mode — show detailed view with DAG.
+		if len(args) == 1 {
+			return showSessionDetail(args[0], jsonMode)
+		}
+
+		// List all sessions mode.
 		sessions, err := db.ListSessions()
 		if err != nil {
 			return fmt.Errorf("list sessions: %w", err)
+		}
+
+		if jsonMode {
+			return encodeSessionsJSON(cmd, sessions)
 		}
 
 		if len(sessions) == 0 {
@@ -194,10 +264,13 @@ var sessionStatusCmd = &cobra.Command{
 			} else if s.Status == "dissolved" {
 				statusIcon = "⚫"
 			}
-			fmt.Printf("%s [%s] %s  (拓扑: %s)\n", statusIcon, s.Status, s.Title, s.Topology)
+			projStr := ""
+			if s.Project.String != "" {
+				projStr = fmt.Sprintf("  项目: %s", s.Project.String)
+			}
+			fmt.Printf("%s [%s] %s  (拓扑: %s%s)\n", statusIcon, s.Status, s.Title, s.Topology, projStr)
 			fmt.Printf("   ID: %s  |  开启: %s\n", s.ID, s.CreatedAt.Format(time.RFC3339))
 
-			// List bills for this session.
 			bills, err := db.ListBillsBySession(s.ID)
 			if err != nil {
 				continue
@@ -214,6 +287,143 @@ var sessionStatusCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// showSessionDetail shows a single session's full status including ASCII DAG.
+func showSessionDetail(sessionID string, jsonMode bool) error {
+	s, err := db.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	bills, err := db.ListBillsBySession(sessionID)
+	if err != nil {
+		return fmt.Errorf("list bills: %w", err)
+	}
+
+	if jsonMode {
+		return encodeSessionsJSON(nil, []*store.Session{s})
+	}
+
+	statusIcon := "🟢"
+	if s.Status == "completed" {
+		statusIcon = "✅"
+	} else if s.Status == "dissolved" {
+		statusIcon = "⚫"
+	}
+	projStr := ""
+	if s.Project.String != "" {
+		projStr = fmt.Sprintf("\n   项目:     %s", s.Project.String)
+	}
+
+	fmt.Printf("%s [%s] %s\n", statusIcon, s.Status, s.Title)
+	fmt.Printf("   ID:       %s\n", s.ID)
+	fmt.Printf("   拓扑:     %s%s\n", s.Topology, projStr)
+	fmt.Printf("   开启:     %s\n", s.CreatedAt.Format("2006-01-02 15:04:05"))
+	fmt.Printf("   议案数:   %d\n", len(bills))
+	fmt.Println()
+
+	if len(bills) == 0 {
+		fmt.Println("本会期暂无议案。")
+		return nil
+	}
+
+	// Bill summary table.
+	fmt.Println("议案列表:")
+	fmt.Println("  ─────────────────────────────────────────────────────")
+	for _, b := range bills {
+		icon := billStatusIcon(b.Status)
+		assignee := b.Assignee.String
+		if assignee == "" {
+			assignee = "(未分配)"
+		}
+		fmt.Printf("  %s %-8s  %-30s  → %s\n", icon, b.Status, truncate(b.Title, 30), assignee)
+	}
+	fmt.Println()
+
+	// ASCII DAG.
+	fmt.Println("依赖关系图 (DAG):")
+	fmt.Println("  ─────────────────────────────────────────────────────")
+
+	// Convert bills to DAGItems.
+	dagItems := make([]*util.DAGItem, 0, len(bills))
+	for _, b := range bills {
+		dagItems = append(dagItems, &util.DAGItem{
+			ID:        b.ID,
+			Title:     b.Title,
+			Status:    b.Status,
+			DependsOn: util.ParseDepsJSON(b.DependsOn.String),
+		})
+	}
+
+	roots := util.BuildDAG(dagItems)
+	dag := util.RenderDAG(roots)
+	// Indent each line by 2 spaces.
+	for _, line := range splitLines(dag) {
+		fmt.Printf("  %s\n", line)
+	}
+	return nil
+}
+
+// encodeSessionsJSON encodes sessions as JSON (used by --json flag).
+func encodeSessionsJSON(cmd *cobra.Command, sessions []*store.Session) error {
+	type billSummary struct {
+		ID       string `json:"id"`
+		Title    string `json:"title"`
+		Status   string `json:"status"`
+		Assignee string `json:"assignee"`
+		Branch   string `json:"branch"`
+	}
+	type sessionJSON struct {
+		ID        string        `json:"id"`
+		Title     string        `json:"title"`
+		Status    string        `json:"status"`
+		Topology  string        `json:"topology"`
+		Project   string        `json:"project,omitempty"`
+		CreatedAt string        `json:"created_at"`
+		Bills     []billSummary `json:"bills"`
+	}
+	out := make([]sessionJSON, 0, len(sessions))
+	for _, s := range sessions {
+		bills, _ := db.ListBillsBySession(s.ID)
+		bSummaries := make([]billSummary, 0, len(bills))
+		for _, b := range bills {
+			bSummaries = append(bSummaries, billSummary{
+				ID:       b.ID,
+				Title:    b.Title,
+				Status:   b.Status,
+				Assignee: b.Assignee.String,
+				Branch:   b.Branch.String,
+			})
+		}
+		out = append(out, sessionJSON{
+			ID:        s.ID,
+			Title:     s.Title,
+			Status:    s.Status,
+			Topology:  s.Topology,
+			Project:   s.Project.String,
+			CreatedAt: s.CreatedAt.Format(time.RFC3339),
+			Bills:     bSummaries,
+		})
+	}
+	var w interface{ Write([]byte) (int, error) }
+	if cmd != nil {
+		w = cmd.OutOrStdout()
+	} else {
+		w = os.Stdout
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// splitLines splits a string into lines, omitting a trailing empty line.
+func splitLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 var sessionDissolveCmd = &cobra.Command{
@@ -268,4 +478,198 @@ func shortID(prefix string) string {
 		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 	}
 	return fmt.Sprintf("%s-%x", prefix, b)
+}
+
+// ─── Phase 5A: session stats ──────────────────────────────────────────────────
+
+var sessionStatsCmd = &cobra.Command{
+	Use:   "stats [session-id]",
+	Short: "显示会期统计数据（议案状态、质量、耗时、部长负荷）",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		allMode, _ := cmd.Flags().GetBool("all")
+
+		if allMode {
+			return showAllSessionStats()
+		}
+		if len(args) == 1 {
+			return showSessionStats(args[0])
+		}
+
+		// Default: show stats for all active sessions.
+		return showAllSessionStats()
+	},
+}
+
+func showSessionStats(sessionID string) error {
+	stats, err := db.GetSessionStats(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session stats: %w", err)
+	}
+	printSessionStats(stats)
+	return nil
+}
+
+func showAllSessionStats() error {
+	allStats, err := db.GetAllSessionStats()
+	if err != nil {
+		return fmt.Errorf("get all session stats: %w", err)
+	}
+	if len(allStats) == 0 {
+		fmt.Println("暂无会期数据。使用 `hoc session open` 开启会期。")
+		return nil
+	}
+	for _, stats := range allStats {
+		printSessionStats(stats)
+		fmt.Println()
+	}
+	return nil
+}
+
+func printSessionStats(stats *store.SessionStats) {
+	statusIcon := "🟢"
+	if stats.Status == "completed" {
+		statusIcon = "✅"
+	} else if stats.Status == "dissolved" {
+		statusIcon = "⚫"
+	}
+
+	fmt.Printf("📊 会期统计 — \"%s\" [%s]\n", stats.Title, stats.SessionID)
+	fmt.Printf("   拓扑: %s  |  状态: %s %s\n", stats.Topology, statusIcon, stats.Status)
+	fmt.Println("──────────────────────────────────────────────────")
+
+	if stats.TotalBills == 0 {
+		fmt.Println("  本会期暂无议案。")
+		return
+	}
+
+	fmt.Printf("  议案总数: %d\n", stats.TotalBills)
+
+	// Status breakdown.
+	enacted := stats.ByStatus["enacted"] + stats.ByStatus["royal_assent"]
+	inProgress := stats.ByStatus["reading"] + stats.ByStatus["committee"]
+	failed := stats.ByStatus["failed"]
+	draft := stats.ByStatus["draft"]
+
+	pct := 0
+	if stats.TotalBills > 0 {
+		pct = int(stats.EnactedRate * 100)
+	}
+	fmt.Printf("  ✅ 已通过: %d (%d%%)   📖 进行中: %d   ❌ 失败: %d   📝 草案: %d\n",
+		enacted, pct, inProgress, failed, draft)
+
+	// Quality bar.
+	if stats.AvgQuality > 0 {
+		bar := buildQualityBar(stats.AvgQuality, 20)
+		fmt.Printf("  平均质量:  %s  %.2f\n", bar, stats.AvgQuality)
+	} else {
+		fmt.Printf("  平均质量:  —（暂无 Hansard 数据）\n")
+	}
+
+	// Duration.
+	if stats.TotalDurS > 0 {
+		fmt.Printf("  总耗时:    %s\n", formatDuration(stats.TotalDurS))
+	}
+
+	// Per-minister breakdown.
+	if len(stats.Ministers) > 0 {
+		fmt.Println()
+		fmt.Println("  部长表现:")
+		for _, ml := range stats.Ministers {
+			qualStr := "—"
+			if ml.AvgQ > 0 {
+				qualStr = fmt.Sprintf("%.2f", ml.AvgQ)
+			}
+			bar := buildQualityBar(ml.AvgQ, 10)
+			fmt.Printf("  %-22s %s  %d bill(s)  %d✅  质量%s\n",
+				truncate(ml.Title, 22), bar, ml.Bills, ml.Enacted, qualStr)
+		}
+	}
+}
+
+// ─── Phase 3E: session migrate ────────────────────────────────────────────────
+
+// sessionMigrateCmd migrates legacy sessions (no project field) to multi-project format.
+// Also resolves the privyAutoMerge issue where whip couldn't merge old sessions.
+var sessionMigrateCmd = &cobra.Command{
+	Use:   "migrate",
+	Short: "迁移旧会期：补全 project 字段（Phase 3E）",
+	Long: `检测并修复旧会期（缺少 project 字段）。
+
+旧会期无法触发枢密院自动合并（privyAutoMerge），通过此命令补全。
+
+示例：
+  hoc session migrate --project myapp              # 预演
+  hoc session migrate --project myapp --confirm    # 执行迁移`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		defaultProject, _ := cmd.Flags().GetString("project")
+		confirm, _ := cmd.Flags().GetBool("confirm")
+
+		sessions, err := db.ListSessions()
+		if err != nil {
+			return fmt.Errorf("list sessions: %w", err)
+		}
+
+		var needsMigration []*store.Session
+		for _, s := range sessions {
+			if len(s.GetProjectsSlice()) == 0 {
+				needsMigration = append(needsMigration, s)
+			}
+		}
+
+		if len(needsMigration) == 0 {
+			fmt.Println("✅ 所有会期均已有 project 字段，无需迁移。")
+			return nil
+		}
+
+		fmt.Printf("📋 需要迁移的会期: %d 个\n\n", len(needsMigration))
+		for _, s := range needsMigration {
+			targetProject := defaultProject
+			fmt.Printf("  [%s] %s — 当前 project: %q → 迁移为: %q\n",
+				s.ID, s.Title,
+				s.Project.String,
+				targetProject,
+			)
+		}
+		fmt.Println()
+
+		if !confirm {
+			fmt.Println("ℹ  预演模式。使用 --confirm 执行实际迁移。")
+			if defaultProject == "" {
+				fmt.Println("  ⚠  请指定 --project <name> 作为默认项目名。")
+			}
+			return nil
+		}
+
+		if defaultProject == "" {
+			return fmt.Errorf("执行迁移时必须指定 --project <name>")
+		}
+
+		migrated := 0
+		for _, s := range needsMigration {
+			projectJSON := `["` + defaultProject + `"]`
+			if err := db.UpdateSessionProjects(s.ID, projectJSON); err != nil {
+				fmt.Printf("  ❌ 迁移失败 [%s]: %v\n", s.ID, err)
+				continue
+			}
+			if err := db.UpdateSessionProject(s.ID, defaultProject); err != nil {
+				fmt.Printf("  ⚠  project 字段更新失败 [%s]: %v\n", s.ID, err)
+			}
+			fmt.Printf("  ✓ [%s] %s → project=%s\n", s.ID, s.Title, defaultProject)
+			migrated++
+		}
+
+		fmt.Printf("\n✅ 迁移完成：%d/%d 个会期已更新。\n", migrated, len(needsMigration))
+		return nil
+	},
 }

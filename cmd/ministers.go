@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -63,14 +66,28 @@ func init() {
 	ministersCmd.AddCommand(ministerDismissCmd)
 	ministersCmd.AddCommand(ministersListCmd)
 	ministersCmd.AddCommand(ministerByElectionCmd)
+	ministersCmd.AddCommand(ministerAutoCmd)
+	ministersCmd.AddCommand(ministerHookCmd)
 
 	ministerAppointCmd.Flags().String("runtime", "claude-code", "Runtime: claude-code, codex, cursor")
 	ministerAppointCmd.Flags().StringSlice("portfolio", []string{}, "技能领域")
 	ministerAppointCmd.Flags().String("title", "", "部长头衔")
 
+	ministersListCmd.Flags().Bool("json", false, "以 JSON 格式输出")
+
 	ministerSummonCmd.Flags().String("bill", "", "要执行的议案 ID")
 	ministerSummonCmd.Flags().String("project", "", "项目名称（与 --bill 配合使用）")
 	ministerSummonCmd.Flags().Bool("no-tmux", false, "前台运行（不使用 tmux）")
+
+	ministerAutoCmd.Flags().String("session", "", "限定会期 ID（不填则监控所有活跃会期）")
+	ministerAutoCmd.Flags().String("project", "", "默认项目名称（会期未设 project 时使用）")
+	ministerAutoCmd.Flags().Int("max-concurrent", 3, "最多同时运行的部长数量")
+	ministerAutoCmd.Flags().Bool("no-tmux", false, "前台运行（不使用 tmux）")
+
+	// Phase 3B: hook subcommands
+	ministerHookCmd.AddCommand(ministerHookPushCmd)
+	ministerHookCmd.AddCommand(ministerHookListCmd)
+	ministerHookCmd.AddCommand(ministerHookPopCmd)
 }
 
 var ministerAppointCmd = &cobra.Command{
@@ -79,7 +96,7 @@ var ministerAppointCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := initDB(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			slog.Error("init db", "err", err)
 			os.Exit(1)
 		}
 		defer db.Close()
@@ -105,7 +122,7 @@ var ministerAppointCmd = &cobra.Command{
 		minister.Status = "offline"
 
 		if err := db.CreateMinister(minister); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating minister: %v\n", err)
+			slog.Error("create minister", "err", err)
 			os.Exit(1)
 		}
 
@@ -198,7 +215,7 @@ var ministerSummonCmd = &cobra.Command{
 
 		// Start runtime.
 		useTmux := !noTmux
-		rt := runtime.NewClaudeCodeRuntime(useTmux)
+		rt := runtime.New(minister.Runtime, useTmux)
 		opts := runtime.SummonOpts{
 			MinisterID:    ministerID,
 			MinisterTitle: minister.Title,
@@ -251,14 +268,14 @@ var ministerDismissCmd = &cobra.Command{
 		}
 
 		// Try to kill tmux session if it exists.
-		rt := runtime.NewClaudeCodeRuntime(true)
+		rt := runtime.New(minister.Runtime, true)
 		sess := &runtime.AgentSession{
 			MinisterID:  ministerID,
 			TmuxSession: fmt.Sprintf("hoc-%s", ministerID),
 		}
 		if rt.IsSeated(sess) {
 			if err := rt.Dismiss(sess); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not dismiss tmux session: %v\n", err)
+				slog.Warn("could not dismiss tmux session", "err", err)
 			}
 		}
 
@@ -283,6 +300,36 @@ var ministersListCmd = &cobra.Command{
 		ministers, err := db.ListMinisters()
 		if err != nil {
 			return fmt.Errorf("list ministers: %w", err)
+		}
+
+		jsonMode, _ := cmd.Flags().GetBool("json")
+		if jsonMode {
+			type ministerJSON struct {
+				ID        string   `json:"id"`
+				Title     string   `json:"title"`
+				Status    string   `json:"status"`
+				Runtime   string   `json:"runtime"`
+				Portfolio []string `json:"portfolio"`
+				Worktree  string   `json:"worktree,omitempty"`
+			}
+			out := make([]ministerJSON, 0, len(ministers))
+			for _, m := range ministers {
+				portfolio := parsePortfolio(m.Skills)
+				if portfolio == nil {
+					portfolio = []string{}
+				}
+				out = append(out, ministerJSON{
+					ID:        m.ID,
+					Title:     m.Title,
+					Status:    m.Status,
+					Runtime:   m.Runtime,
+					Portfolio: portfolio,
+					Worktree:  m.Worktree.String,
+				})
+			}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
 		}
 
 		fmt.Println("📋 内阁花名册:")
@@ -394,7 +441,7 @@ var ministerByElectionCmd = &cobra.Command{
 
 			// Reset bill.
 			if err := db.ClearBillAssignment(b.ID); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: clear bill %s: %v\n", b.ID, err)
+				slog.Warn("clear bill assignment", "bill_id", b.ID, "err", err)
 			}
 			fmt.Printf("   📄 议案 [%s] 已重置为 draft\n", b.ID)
 		}
@@ -404,6 +451,204 @@ var ministerByElectionCmd = &cobra.Command{
 		fmt.Printf("  使用 `hoc whip start` 让 Whip 自动重新派发就绪议案。\n")
 		return nil
 	},
+}
+
+// ─── minister auto (8-4) ─────────────────────────────────────────────────────
+
+// ministerAutoCmd continuously monitors active sessions and auto-summons ministers
+// for bills that have been assigned but not yet started.
+var ministerAutoCmd = &cobra.Command{
+	Use:   "auto",
+	Short: "全自动模式：监控 Whip 分配，自动传召部长执行议案",
+	Long: `全自动模式：持续循环，检测 Whip 分配的就绪议案，自动传召部长，监控完成信号，自动休会。
+需要同时运行 hoc whip start 以驱动任务分配。
+
+示例:
+  hoc minister auto                           # 监控所有活跃会期
+  hoc minister auto --session session-abc     # 只处理指定会期
+  hoc minister auto --max-concurrent 2        # 最多 2 个并发部长
+  hoc minister auto --project myapp           # 默认项目（会期未配置 project 时使用）`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		sessionFilter, _ := cmd.Flags().GetString("session")
+		defaultProject, _ := cmd.Flags().GetString("project")
+		maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
+		noTmux, _ := cmd.Flags().GetBool("no-tmux")
+
+		fmt.Printf("🤖 部长全自动模式启动（最大并发: %d）\n", maxConcurrent)
+		if sessionFilter != "" {
+			fmt.Printf("   限定会期: %s\n", sessionFilter)
+		}
+		fmt.Printf("   按 Ctrl+C 停止。\n\n")
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer cancel()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		// Run immediately on start.
+		autoIterate(db, hocDir, sessionFilter, defaultProject, maxConcurrent, noTmux)
+
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("\n✓ 全自动模式已停止")
+				return nil
+			case <-ticker.C:
+				autoIterate(db, hocDir, sessionFilter, defaultProject, maxConcurrent, noTmux)
+			}
+		}
+	},
+}
+
+// autoIterate is one cycle of the auto loop:
+//  1. Count currently working ministers (respect max-concurrent).
+//  2. Find sessions with assigned-but-not-started bills (status=reading, minister=idle).
+//  3. Summon those ministers (create chamber + start runtime).
+func autoIterate(db *store.DB, hocDir, sessionFilter, defaultProject string, maxConcurrent int, noTmux bool) {
+	// Count currently working ministers.
+	working, err := db.ListWorkingMinisters()
+	if err != nil {
+		slog.Warn("autoIterate: list working", "err", err)
+		return
+	}
+	if len(working) >= maxConcurrent {
+		slog.Debug("auto: 已达最大并发数", "working", len(working), "max", maxConcurrent)
+		return
+	}
+
+	sessions, err := db.ListActiveSessions()
+	if err != nil {
+		slog.Warn("autoIterate: list sessions", "err", err)
+		return
+	}
+
+	for _, sess := range sessions {
+		if sessionFilter != "" && sess.ID != sessionFilter {
+			continue
+		}
+
+		project := sess.Project.String
+		if project == "" {
+			project = defaultProject
+		}
+		if project == "" {
+			slog.Debug("auto: 会期无 project，跳过", "session_id", sess.ID)
+			continue
+		}
+
+		bills, err := db.ListBillsBySession(sess.ID)
+		if err != nil {
+			continue
+		}
+
+		for _, bill := range bills {
+			if bill.Status != "reading" || bill.Assignee.String == "" {
+				continue
+			}
+
+			minister, err := db.GetMinister(bill.Assignee.String)
+			if err != nil {
+				continue
+			}
+			if minister.Status != "idle" {
+				continue // Already working or offline.
+			}
+
+			if len(working) >= maxConcurrent {
+				return
+			}
+
+			fmt.Printf("🤖 自动传召 %s → 议案 [%s] %s\n", minister.Title, bill.ID, bill.Title)
+			if err := doSummon(db, hocDir, minister.ID, bill.ID, project, !noTmux); err != nil {
+				slog.Warn("autoIterate: summon failed", "minister", minister.ID, "bill", bill.ID, "err", err)
+				continue
+			}
+
+			// Refresh minister from DB for working list.
+			if refreshed, err := db.GetMinister(minister.ID); err == nil {
+				working = append(working, refreshed)
+			}
+		}
+	}
+}
+
+// doSummon performs the core summon logic: create/reuse chamber, write bill brief, start runtime, update DB.
+func doSummon(db *store.DB, hocDir, ministerID, billID, projectName string, useTmux bool) error {
+	minister, err := db.GetMinister(ministerID)
+	if err != nil {
+		return fmt.Errorf("minister not found: %s", ministerID)
+	}
+
+	bill, err := db.GetBill(billID)
+	if err != nil {
+		return fmt.Errorf("bill not found: %s", billID)
+	}
+
+	mainRepoPath := filepath.Join(hocDir, "projects", projectName, "main")
+	if _, err := os.Stat(mainRepoPath); os.IsNotExist(err) {
+		return fmt.Errorf("项目 %s 不存在，请先运行 hoc project add", projectName)
+	}
+
+	ch, err := chamber.NewChamber(hocDir, projectName, ministerID, mainRepoPath)
+	if err != nil {
+		return fmt.Errorf("init chamber: %w", err)
+	}
+	if _, statErr := os.Stat(ch.GetWorktreePath()); os.IsNotExist(statErr) {
+		if err := ch.Create(); err != nil {
+			return fmt.Errorf("create chamber: %w", err)
+		}
+	}
+
+	brief := buildBillBrief(minister, bill, ch.GetBranchName())
+
+	upstreamGazettes, _ := db.ListGazettesForBill(billID)
+	if len(upstreamGazettes) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n## 上游公报（来自前序部长）\n\n")
+		for _, g := range upstreamGazettes {
+			sb.WriteString(fmt.Sprintf("**[%s]** %s:\n\n%s\n\n---\n\n",
+				g.Type.String,
+				orDash(g.FromMinister.String),
+				g.Summary,
+			))
+		}
+		brief += sb.String()
+	}
+
+	rt := runtime.New(minister.Runtime, useTmux)
+	opts := runtime.SummonOpts{
+		MinisterID:    ministerID,
+		MinisterTitle: minister.Title,
+		ChamberPath:   ch.GetWorktreePath(),
+		BillBrief:     brief,
+	}
+
+	agentSess, err := rt.Summon(opts)
+	if err != nil {
+		return fmt.Errorf("summon runtime: %w", err)
+	}
+
+	_ = db.UpdateMinisterStatus(ministerID, "working")
+	_ = db.UpdateMinisterWorktree(ministerID, ch.GetWorktreePath())
+	if agentSess.PID > 0 {
+		_ = db.UpdateMinisterPID(ministerID, agentSess.PID)
+	}
+	_ = db.AssignBill(billID, ministerID)
+	_ = db.UpdateBillStatus(billID, "reading")
+	_ = db.UpdateBillBranch(billID, ch.GetBranchName())
+
+	if useTmux {
+		fmt.Printf("   ✅ %s 已在 tmux [hoc-%s] 就绪\n", minister.Title, ministerID)
+	} else {
+		fmt.Printf("   ✅ %s 已启动 (PID: %d)\n", minister.Title, agentSess.PID)
+	}
+	return nil
 }
 
 // runGitInDir runs a git command in the given directory and returns stdout+stderr.
@@ -465,6 +710,13 @@ func buildBillBrief(minister *store.Minister, bill *store.Bill, branch string) s
 
    `+"`"+`git add -A && git commit -m "bill(%s): %s"`+"`"+`
 
+5. **最后一步（必须执行）**：写入完成信号文件，让 Whip 自动将议案标记为 enacted：
+
+   `+"```bash"+`
+   mkdir -p .hoc
+   echo "工作已完成。[简短摘要]" > .hoc/bill-%s.done
+   `+"```"+`
+
 ---
 
 ## 完成后公报模板
@@ -508,6 +760,7 @@ func buildBillBrief(minister *store.Minister, bill *store.Bill, branch string) s
 		bill.ID,
 		bill.ID,
 		bill.ID,
+		bill.ID, // done file: .hoc/bill-%s.done
 		bill.Title,
 		bill.ID,
 		minister.Title,
@@ -515,4 +768,116 @@ func buildBillBrief(minister *store.Minister, bill *store.Bill, branch string) s
 		today,
 		branch,
 	)
+}
+
+// ─── Phase 3B: Minister Hook Queue Commands ───────────────────────────────────
+
+// ministerHookCmd is the parent command for hook queue management.
+var ministerHookCmd = &cobra.Command{
+	Use:   "hook",
+	Short: "管理 Minister 的 Hook 队列（Phase 3B）",
+	Long: `Hook 队列允许预先为 Minister 排队分配议案。
+当 Minister 完成当前议案变为 idle 时，Whip 自动从队列中接单。
+
+这解决了 cabinet reshuffle 每个 Minister 只分配一份议案的限制。`,
+	Run: func(cmd *cobra.Command, args []string) {
+		cmd.Help()
+	},
+}
+
+// ministerHookPushCmd enqueues a bill into a minister's hook queue.
+var ministerHookPushCmd = &cobra.Command{
+	Use:   "push <minister-id> <bill-id>",
+	Short: "将议案加入 Minister 的 Hook 队列",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ministerID := args[0]
+		billID := args[1]
+
+		// Verify minister exists.
+		if _, err := db.GetMinister(ministerID); err != nil {
+			return fmt.Errorf("minister not found: %s", ministerID)
+		}
+		// Verify bill exists.
+		if _, err := db.GetBill(billID); err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if err := db.PushHook(ministerID, billID); err != nil {
+			return fmt.Errorf("push hook: %w", err)
+		}
+
+		queue, _ := db.PeekHook(ministerID)
+		fmt.Printf("✅ 议案 [%s] 已加入 %s 的 Hook 队列（队列长度: %d）\n", billID, ministerID, len(queue))
+		return nil
+	},
+}
+
+// ministerHookListCmd shows the hook queue for a minister.
+var ministerHookListCmd = &cobra.Command{
+	Use:   "list <minister-id>",
+	Short: "查看 Minister 的 Hook 队列",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ministerID := args[0]
+		queue, err := db.PeekHook(ministerID)
+		if err != nil {
+			return fmt.Errorf("peek hook: %w", err)
+		}
+
+		if len(queue) == 0 {
+			fmt.Printf("📭 %s 的 Hook 队列为空\n", ministerID)
+			return nil
+		}
+
+		fmt.Printf("📋 %s 的 Hook 队列（%d 个议案）：\n", ministerID, len(queue))
+		for i, billID := range queue {
+			b, err := db.GetBill(billID)
+			title := billID
+			status := "?"
+			if err == nil {
+				title = b.Title
+				status = b.Status
+			}
+			fmt.Printf("  %d. [%s] %s (%s)\n", i+1, billID, title, status)
+		}
+		return nil
+	},
+}
+
+// ministerHookPopCmd removes the first item from a minister's hook queue.
+var ministerHookPopCmd = &cobra.Command{
+	Use:   "pop <minister-id>",
+	Short: "从 Minister 的 Hook 队列取出最早的议案",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ministerID := args[0]
+		billID, err := db.PopHook(ministerID)
+		if err != nil {
+			return fmt.Errorf("pop hook: %w", err)
+		}
+
+		if billID == "" {
+			fmt.Printf("📭 %s 的 Hook 队列为空\n", ministerID)
+			return nil
+		}
+
+		fmt.Printf("✅ 已取出议案 [%s]\n", billID)
+		return nil
+	},
 }

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/house-of-cards/hoc/internal/config"
 	"github.com/house-of-cards/hoc/internal/whip"
 	"github.com/spf13/cobra"
 )
@@ -28,6 +30,7 @@ func init() {
 	whipCmd.AddCommand(whipStartCmd)
 	whipCmd.AddCommand(whipStopCmd)
 	whipCmd.AddCommand(whipReportCmd)
+	whipReportCmd.Flags().Bool("history", false, "展示最近 10 次 Hansard 事件日志")
 }
 
 // ─── whip start ──────────────────────────────────────────────────────────────
@@ -53,7 +56,7 @@ var whipStartCmd = &cobra.Command{
 		// Write PID file.
 		pidFile := whipPIDFile()
 		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
+			slog.Warn("could not write PID file", "err", err)
 		}
 		defer os.Remove(pidFile)
 
@@ -72,7 +75,7 @@ var whipStartCmd = &cobra.Command{
 			cancel()
 		}()
 
-		w := whip.New(db, hocDir, os.Stdout)
+		w := whip.New(db, hocDir)
 		w.Run(ctx)
 		return nil
 	},
@@ -84,6 +87,9 @@ var whipStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "停止 Whip daemon",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if hocDir == "" {
+			hocDir = config.GetHOCHome()
+		}
 		pidFile := whipPIDFile()
 		data, err := os.ReadFile(pidFile)
 		if err != nil {
@@ -130,7 +136,8 @@ var whipReportCmd = &cobra.Command{
 			fmt.Printf("🔴 党鞭状态: 未运行\n\n")
 		}
 
-		report, err := whip.Report(db)
+		showHistory, _ := cmd.Flags().GetBool("history")
+		report, err := whip.Report(db, showHistory)
 		if err != nil {
 			return fmt.Errorf("generate report: %w", err)
 		}

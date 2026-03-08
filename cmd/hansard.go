@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/house-of-cards/hoc/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -27,6 +28,9 @@ var hansardCmd = &cobra.Command{
 
 func init() {
 	hansardCmd.AddCommand(hansardListCmd)
+	hansardCmd.AddCommand(hansardTrendCmd)
+	hansardCmd.AddCommand(hansardScoreCmd)
+	hansardTrendCmd.Flags().Int("last", 10, "分析最近 N 条 Hansard 记录（每位部长）")
 }
 
 var hansardListCmd = &cobra.Command{
@@ -142,6 +146,183 @@ func showMinisterHansard(ministerID string) error {
 		}
 	}
 	return nil
+}
+
+var hansardTrendCmd = &cobra.Command{
+	Use:   "trend",
+	Short: "显示各部长成功率趋势 ASCII 条形图",
+	Long:  "分析最近 N 条 Hansard 记录，渲染每位部长的成功率条形图。",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		lastN, _ := cmd.Flags().GetInt("last")
+		return showHansardTrend(lastN)
+	},
+}
+
+func showHansardTrend(lastN int) error {
+	ministers, err := db.ListMinisters()
+	if err != nil {
+		return fmt.Errorf("list ministers: %w", err)
+	}
+
+	if len(ministers) == 0 {
+		fmt.Println("暂无部长。")
+		return nil
+	}
+
+	fmt.Printf("📊 Hansard 成功率趋势 (最近 %d 条/部长)\n", lastN)
+	fmt.Println("─────────────────────────────────────────────────")
+
+	var items []util.BarItem
+	for _, m := range ministers {
+		entries, err := db.ListHansardByMinister(m.ID)
+		if err != nil {
+			continue
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		// Take at most lastN entries (already sorted newest-first by DB).
+		if len(entries) > lastN {
+			entries = entries[:lastN]
+		}
+		enacted := 0
+		for _, h := range entries {
+			if h.Outcome.String == "enacted" {
+				enacted++
+			}
+		}
+		items = append(items, util.BarItem{
+			Label:   truncate(m.Title, 22),
+			Success: enacted,
+			Total:   len(entries),
+		})
+	}
+
+	if len(items) == 0 {
+		fmt.Println("暂无议事录数据。")
+		return nil
+	}
+
+	fmt.Print(util.RenderBarChart(items, 20))
+	return nil
+}
+
+// ─── hansard score ──────────────────────────────────────────────────────────
+
+var hansardScoreCmd = &cobra.Command{
+	Use:   "score",
+	Short: "显示各部长质量评分排名",
+	Long:  "分析 Hansard 数据，按平均质量分（0.0–1.0）排名所有部长，并列出各 portfolio 表现。",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+		return showHansardScore()
+	},
+}
+
+func showHansardScore() error {
+	ministers, err := db.ListMinisters()
+	if err != nil {
+		return fmt.Errorf("list ministers: %w", err)
+	}
+
+	if len(ministers) == 0 {
+		fmt.Println("暂无部长。")
+		return nil
+	}
+
+	type scoreEntry struct {
+		ministerID string
+		title      string
+		avgQuality float64
+		enacted    int
+		total      int
+		rate       float64
+	}
+
+	var entries []scoreEntry
+	for _, m := range ministers {
+		avg, _ := db.GetMinisterAvgQuality(m.ID)
+		enacted, total, _ := db.HansardSuccessRate(m.ID)
+		rate := 0.0
+		if total > 0 {
+			rate = float64(enacted) / float64(total) * 100
+		}
+		entries = append(entries, scoreEntry{
+			ministerID: m.ID,
+			title:      m.Title,
+			avgQuality: avg,
+			enacted:    enacted,
+			total:      total,
+			rate:       rate,
+		})
+	}
+
+	// Sort by avgQuality descending.
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].avgQuality > entries[i].avgQuality {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+
+	fmt.Println("🏆 Hansard 质量评分排名")
+	fmt.Println("─────────────────────────────────────────────────────")
+	fmt.Printf("  %-3s  %-26s  %-8s  %-14s  %s\n", "排名", "部长", "质量分", "成功率", "Hansard")
+	fmt.Println("  ─────────────────────────────────────────────────────")
+
+	medals := []string{"🥇", "🥈", "🥉"}
+	for i, e := range entries {
+		rank := fmt.Sprintf("#%d", i+1)
+		if i < len(medals) {
+			rank = medals[i]
+		}
+
+		qualBar := buildQualityBar(e.avgQuality, 10)
+		rateStr := "—"
+		if e.total > 0 {
+			rateStr = fmt.Sprintf("%d/%d(%.0f%%)", e.enacted, e.total, e.rate)
+		}
+		qualStr := "—"
+		if e.total > 0 {
+			qualStr = fmt.Sprintf("%.3f", e.avgQuality)
+		}
+
+		fmt.Printf("  %-4s %-26s  %s %s  %-14s  %d条\n",
+			rank,
+			truncate(e.title, 26),
+			qualBar,
+			qualStr,
+			rateStr,
+			e.total,
+		)
+	}
+
+	fmt.Println()
+	fmt.Println("📊 说明: 质量分 = outcome(0.8/0.4/0) + 委员会通过(+0.15) + 无补选(+0.05)")
+	fmt.Println("         分数范围 0.0（失败）~ 1.0（完美通过）")
+	return nil
+}
+
+// buildQualityBar renders a short visual bar for a quality score in [0,1].
+func buildQualityBar(q float64, width int) string {
+	if q < 0 {
+		q = 0
+	}
+	if q > 1 {
+		q = 1
+	}
+	filled := int(q * float64(width))
+	bar := "[" + repeat("█", filled) + repeat("░", width-filled) + "]"
+	return bar
 }
 
 func formatDuration(seconds int) string {

@@ -24,6 +24,7 @@ type ContextData struct {
 	AllSessions    []*store.Session
 	Ministers      []*MinisterSummary
 	RecentGazettes []*store.Gazette
+	ByElections    []*store.Hansard // recent by-election events
 }
 
 // SessionSummary aggregates a session with its bill counts.
@@ -39,6 +40,14 @@ type MinisterSummary struct {
 	Minister *store.Minister
 	Enacted  int
 	Total    int
+}
+
+// Decision represents a single actionable directive from the Speaker.
+type Decision struct {
+	Action    string // "assign", "by-election", "escalate"
+	Target    string // primary target (bill-id or minister-id)
+	Secondary string // secondary arg (minister-id for "assign")
+	Raw       string // original directive line
 }
 
 // GenerateContext builds the Speaker context.md content from live DB state.
@@ -65,6 +74,145 @@ func ContextPath(hocDir string) string {
 	return filepath.Join(hocDir, contextRelPath)
 }
 
+// SelectTopology analyzes a set of bills and recommends the best collaboration topology.
+// Returns "parallel", "pipeline", or "tree".
+func SelectTopology(bills []*store.Bill) string {
+	if len(bills) == 0 {
+		return "parallel"
+	}
+
+	// Count how many bills have at least one dependency.
+	hasDeps := 0
+	for _, b := range bills {
+		if b.DependsOn.String != "" {
+			hasDeps++
+		}
+	}
+
+	// No dependencies at all → pure parallel.
+	if hasDeps == 0 {
+		return "parallel"
+	}
+
+	// Build a map: bill-id → how many other bills depend on it.
+	dependentCount := make(map[string]int)
+	for _, b := range bills {
+		if b.DependsOn.String == "" {
+			continue
+		}
+		var deps []string
+		if err := json.Unmarshal([]byte(b.DependsOn.String), &deps); err != nil {
+			// Treat malformed deps as a single dependency.
+			deps = []string{b.DependsOn.String}
+		}
+		if len(deps) > 1 {
+			// A bill with multiple upstream dependencies signals tree topology.
+			return "tree"
+		}
+		for _, d := range deps {
+			dependentCount[d]++
+		}
+	}
+
+	// If any bill is depended upon by more than one other bill, it's a tree (fan-in).
+	for _, count := range dependentCount {
+		if count > 1 {
+			return "tree"
+		}
+	}
+
+	// All dependencies are single-in, single-out → linear pipeline.
+	return "pipeline"
+}
+
+// ParseDecision parses a block of text and extracts Speaker directives.
+// Directives must appear on their own lines in the format:
+//
+//	[DIRECTIVE] assign <bill-id> <minister-id>
+//	[DIRECTIVE] by-election <minister-id>
+//	[DIRECTIVE] escalate <bill-id>
+func ParseDecision(text string) []Decision {
+	var decisions []Decision
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[DIRECTIVE]") {
+			continue
+		}
+		raw := line
+		parts := strings.Fields(strings.TrimPrefix(line, "[DIRECTIVE]"))
+		if len(parts) == 0 {
+			continue
+		}
+		d := Decision{Raw: raw, Action: parts[0]}
+		switch d.Action {
+		case "assign":
+			if len(parts) >= 3 {
+				d.Target = parts[1]
+				d.Secondary = parts[2]
+				decisions = append(decisions, d)
+			}
+		case "by-election":
+			if len(parts) >= 2 {
+				d.Target = parts[1]
+				decisions = append(decisions, d)
+			}
+		case "escalate":
+			if len(parts) >= 2 {
+				d.Target = parts[1]
+				decisions = append(decisions, d)
+			}
+		}
+	}
+	return decisions
+}
+
+// RunPatrol invokes the Speaker AI with a structured patrol prompt (non-interactive)
+// and returns the parsed directives from the AI's response.
+func RunPatrol(hocDir, contextContent string) ([]Decision, error) {
+	patrolPromptPath := filepath.Join(hocDir, ".hoc", "speaker", "patrol-prompt.md")
+	if err := writePatrolPrompt(patrolPromptPath, contextContent); err != nil {
+		return nil, fmt.Errorf("write patrol prompt: %w", err)
+	}
+
+	cmd := exec.Command("claude", "-p", "@"+patrolPromptPath)
+	cmd.Dir = hocDir
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("claude patrol: %w", err)
+	}
+
+	return ParseDecision(string(out)), nil
+}
+
+// writePatrolPrompt writes the Speaker's patrol decision prompt.
+func writePatrolPrompt(path, contextContent string) error {
+	content := fmt.Sprintf(`# 议长巡视简报（Speaker Patrol Briefing）
+
+> 你是 House of Cards 的议长（Speaker）。请基于以下政府状态快照做出决策。
+
+## 当前政府状态
+
+%s
+
+## 决策规则
+
+1. 如有 draft 状态且未分配的议案，且有合适的 idle 部长 → 输出 assign 指令
+2. 如有 stuck 部长超过 10 分钟 → 输出 by-election 指令
+3. 如同一议案 failed 超过 2 次 → 输出 escalate 指令
+4. 无需行动时，不输出任何 [DIRECTIVE] 行，直接说明原因
+
+## 指令输出格式（每条独占一行）
+
+[DIRECTIVE] assign <bill-id> <minister-id>
+[DIRECTIVE] by-election <minister-id>
+[DIRECTIVE] escalate <bill-id>
+
+## 你的决策（仅输出指令行和简短说明）：
+`, contextContent)
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
 // Summon starts the Speaker AI session with the current context injected.
 // useTmux=true runs in a detached tmux session named "hoc-speaker".
 // useTmux=false runs interactively in the foreground.
@@ -74,15 +222,21 @@ func Summon(hocDir string, useTmux bool) error {
 		return fmt.Errorf("Speaker context 文件不存在：%s\n请先运行 hoc speaker context --refresh", ctxPath)
 	}
 
+	// Read the context content to embed directly in the prompt.
+	ctxBytes, err := os.ReadFile(ctxPath)
+	if err != nil {
+		return fmt.Errorf("read speaker context: %w", err)
+	}
+	contextContent := string(ctxBytes)
+
+	speakerPromptPath := filepath.Join(hocDir, ".hoc", "speaker", "prompt.md")
+	if err := writeSpeakerPrompt(speakerPromptPath, contextContent); err != nil {
+		return fmt.Errorf("write speaker prompt: %w", err)
+	}
+
 	if useTmux {
 		tmuxName := "hoc-speaker"
 		_ = exec.Command("tmux", "kill-session", "-t", tmuxName).Run()
-
-		// Build the speaker prompt path relative to the hocDir.
-		speakerPromptPath := filepath.Join(hocDir, ".hoc", "speaker", "prompt.md")
-		if err := writeSpeakerPrompt(speakerPromptPath); err != nil {
-			return fmt.Errorf("write speaker prompt: %w", err)
-		}
 
 		shellCmd := fmt.Sprintf("claude -p @%s", speakerPromptPath)
 		cmd := exec.Command("tmux", "new-session", "-d",
@@ -97,11 +251,6 @@ func Summon(hocDir string, useTmux bool) error {
 		fmt.Printf("   查看: tmux attach -t hoc-speaker\n")
 	} else {
 		// Interactive foreground mode.
-		speakerPromptPath := filepath.Join(hocDir, ".hoc", "speaker", "prompt.md")
-		if err := writeSpeakerPrompt(speakerPromptPath); err != nil {
-			return fmt.Errorf("write speaker prompt: %w", err)
-		}
-
 		cmd := exec.Command("claude", "-p", "@"+speakerPromptPath)
 		cmd.Dir = hocDir
 		cmd.Stdin = os.Stdin
@@ -112,9 +261,9 @@ func Summon(hocDir string, useTmux bool) error {
 	return nil
 }
 
-// writeSpeakerPrompt writes the speaker's initial system prompt which includes
-// the context file reference and role instructions.
-func writeSpeakerPrompt(path string) error {
+// writeSpeakerPrompt writes the speaker's initial system prompt with the
+// current government context embedded directly (not via {{include:}} placeholder).
+func writeSpeakerPrompt(path string, contextContent string) error {
 	content := fmt.Sprintf(`# 议长就职简报（Speaker Briefing）
 
 > 你是 House of Cards 多 Agent 协作框架的**议长（Speaker）**。
@@ -124,9 +273,9 @@ func writeSpeakerPrompt(path string) error {
 
 ## 政府当前状态
 
-> 以下是最新的政府状态快照（来自 %s）：
+> 以下是最新的政府状态快照（生成时间：%s）：
 
-{{include: %s}}
+%s
 
 ---
 
@@ -155,7 +304,7 @@ func writeSpeakerPrompt(path string) error {
 - 审阅公报并决定下一步行动
 
 *议长就绪，请指示。*
-`, time.Now().Format("2006-01-02 15:04:05"), filepath.Dir(path)+"/context.md")
+`, time.Now().Format("2006-01-02 15:04:05"), contextContent)
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
@@ -202,6 +351,10 @@ func collectContextData(db *store.DB) (*ContextData, error) {
 	}
 	data.RecentGazettes = gazettes
 
+	// Fetch recent by-election records (max 3).
+	byElections, _ := db.ListByElectionHansard(3)
+	data.ByElections = byElections
+
 	return data, nil
 }
 
@@ -214,14 +367,7 @@ func renderContext(data *ContextData) string {
 	sb.WriteString(fmt.Sprintf("> 生成时间：%s\n\n", data.GeneratedAt.Format("2006-01-02 15:04:05")))
 	sb.WriteString("---\n\n")
 
-	// Government overview.
-	sb.WriteString("## 政府现状\n\n")
-	activeSessions := 0
-	for _, s := range data.AllSessions {
-		if s.Status == "active" {
-			activeSessions++
-		}
-	}
+	// Count minister status breakdowns (reused across sections).
 	working, idle, stuck, offline := 0, 0, 0, 0
 	for _, ms := range data.Ministers {
 		switch ms.Minister.Status {
@@ -235,9 +381,32 @@ func renderContext(data *ContextData) string {
 			offline++
 		}
 	}
+	total := len(data.Ministers)
+
+	// Government overview.
+	sb.WriteString("## 政府现状\n\n")
+	activeSessions := 0
+	for _, s := range data.AllSessions {
+		if s.Status == "active" {
+			activeSessions++
+		}
+	}
 	sb.WriteString(fmt.Sprintf("- 活跃会期：%d 个（共 %d 个）\n", activeSessions, len(data.AllSessions)))
 	sb.WriteString(fmt.Sprintf("- 内阁：%d 位部长（工作中 %d / 待命 %d / 卡住 %d / 离线 %d）\n\n",
-		len(data.Ministers), working, idle, stuck, offline))
+		total, working, idle, stuck, offline))
+
+	// Resource utilization.
+	sb.WriteString("## 资源利用率\n\n")
+	active := working + idle
+	utilization := 0.0
+	if total > 0 {
+		utilization = float64(active) / float64(total) * 100
+	}
+	sb.WriteString(fmt.Sprintf("- 在任部长（工作中+待命）：%d / %d (%.0f%%)\n", active, total, utilization))
+	if stuck > 0 {
+		sb.WriteString(fmt.Sprintf("- ⚠ 卡住部长 %d 位，需要关注\n", stuck))
+	}
+	sb.WriteString("\n")
 
 	// Sessions detail.
 	sb.WriteString("## 会期进度\n\n")
@@ -251,8 +420,9 @@ func renderContext(data *ContextData) string {
 		} else if ss.Session.Status == "dissolved" {
 			icon = "⚫"
 		}
-		sb.WriteString(fmt.Sprintf("### %s %s [%s] (%d/%d Bills)\n\n",
-			icon, ss.Session.Title, ss.Session.Status, ss.Done, ss.Total))
+		topology := ss.Session.Topology
+		sb.WriteString(fmt.Sprintf("### %s %s [%s] (%d/%d Bills) | 拓扑: `%s`\n\n",
+			icon, ss.Session.Title, ss.Session.Status, ss.Done, ss.Total, topology))
 
 		for _, b := range ss.Bills {
 			statusIcon := billIcon(b.Status)
@@ -265,6 +435,28 @@ func renderContext(data *ContextData) string {
 		}
 		sb.WriteString("\n")
 	}
+
+	// Topology recommendations for active sessions.
+	sb.WriteString("## 拓扑推荐\n\n")
+	hasActive := false
+	for _, ss := range data.ActiveSessions {
+		if ss.Session.Status != "active" {
+			continue
+		}
+		hasActive = true
+		recommended := SelectTopology(ss.Bills)
+		current := ss.Session.Topology
+		match := "✓ 当前拓扑合适"
+		if recommended != current {
+			match = fmt.Sprintf("⚡ 建议改为 `%s`", recommended)
+		}
+		sb.WriteString(fmt.Sprintf("- **%s**: 当前 `%s` — %s（%s）\n",
+			ss.Session.Title, current, topologyReason(current), match))
+	}
+	if !hasActive {
+		sb.WriteString("暂无活跃会期。\n")
+	}
+	sb.WriteString("\n")
 
 	// Cabinet directory.
 	sb.WriteString("## 内阁档案\n\n")
@@ -292,6 +484,20 @@ func renderContext(data *ContextData) string {
 	}
 	sb.WriteString("\n")
 
+	// Recent by-election records.
+	if len(data.ByElections) > 0 {
+		sb.WriteString("## 近期补选记录\n\n")
+		for _, be := range data.ByElections {
+			note := be.Notes.String
+			if note == "" {
+				note = "原因不明"
+			}
+			sb.WriteString(fmt.Sprintf("- 部长 `%s`，议案 `%s`：%s (%s)\n",
+				be.MinisterID, be.BillID, truncate(note, 80), be.CreatedAt.Format("01/02 15:04")))
+		}
+		sb.WriteString("\n")
+	}
+
 	// Recent Gazettes.
 	sb.WriteString("## 近期公报（最新 10 份）\n\n")
 	if len(data.RecentGazettes) == 0 {
@@ -308,6 +514,14 @@ func renderContext(data *ContextData) string {
 		}
 		sb.WriteString(fmt.Sprintf("- **[%s]** %s → %s: %s\n",
 			g.Type.String, from, to, truncate(g.Summary, 80)))
+	}
+	sb.WriteString("\n")
+
+	// Recommended actions.
+	sb.WriteString("## 推荐行动\n\n")
+	actions := generateRecommendedActions(data, working, idle, stuck)
+	for i, action := range actions {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, action))
 	}
 	sb.WriteString("\n")
 
@@ -357,4 +571,68 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return string(runes[:max-3]) + "..."
+}
+
+// topologyReason returns a brief human-readable explanation of why a topology was chosen.
+func topologyReason(topology string) string {
+	switch topology {
+	case "parallel":
+		return "各议案独立并行，适合前后端分工"
+	case "pipeline":
+		return "逐步依赖传递，适合数据管道"
+	case "tree":
+		return "多议案汇合，适合集成前的并行开发"
+	case "mesh":
+		return "多向依赖，适合架构设计讨论"
+	default:
+		return "自定义拓扑"
+	}
+}
+
+// generateRecommendedActions produces a prioritized list of suggested actions
+// based on the current government state.
+func generateRecommendedActions(data *ContextData, working, idle, stuck int) []string {
+	var actions []string
+
+	// Priority 1: stuck ministers need immediate attention.
+	for _, ms := range data.Ministers {
+		if ms.Minister.Status == "stuck" {
+			actions = append(actions, fmt.Sprintf("🔴 [紧急] 部长 [%s] 卡住，建议触发补选（by-election）", ms.Minister.ID))
+		}
+	}
+
+	// Priority 2: unassigned bills in active sessions.
+	draftCount := 0
+	for _, ss := range data.ActiveSessions {
+		if ss.Session.Status != "active" {
+			continue
+		}
+		for _, b := range ss.Bills {
+			if b.Status == "draft" && b.Assignee.String == "" {
+				draftCount++
+				if draftCount <= 3 {
+					actions = append(actions, fmt.Sprintf("📝 议案 [%s] \"%s\" 等待分配（draft）",
+						b.ID, truncate(b.Title, 40)))
+				}
+			}
+		}
+	}
+	if draftCount > 3 {
+		actions = append(actions, fmt.Sprintf("📝 还有 %d 份草案等待分配", draftCount-3))
+	}
+
+	// Priority 3: idle ministers with nothing to do.
+	if idle > 0 && draftCount == 0 {
+		actions = append(actions, fmt.Sprintf("💡 %d 位部长待命但无议案，可考虑开启新会期", idle))
+	}
+
+	// Priority 4: all good.
+	if len(actions) == 0 {
+		actions = append(actions, "✅ 系统运行正常，无紧急行动")
+		if working > 0 {
+			actions = append(actions, fmt.Sprintf("📊 %d 位部长正在工作，等待 done 文件信号", working))
+		}
+	}
+
+	return actions
 }

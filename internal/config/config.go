@@ -5,17 +5,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/BurntSushi/toml"
+	"github.com/fsnotify/fsnotify"
 )
 
 type Config struct {
-	Home     string         `toml:"-"`
-	House    HouseConfig    `toml:"house"`
-	Speaker  SpeakerConfig  `toml:"speaker"`
-	Whip     WhipConfig     `toml:"whip"`
-	Storage  StorageConfig  `toml:"storage"`
-	Defaults DefaultsConfig `toml:"defaults"`
+	Home          string              `toml:"-"`
+	House         HouseConfig         `toml:"house"`
+	Speaker       SpeakerConfig       `toml:"speaker"`
+	Whip          WhipConfig          `toml:"whip"`
+	Storage       StorageConfig       `toml:"storage"`
+	Defaults      DefaultsConfig      `toml:"defaults"`
+	Observability ObservabilityConfig `toml:"observability"`
+}
+
+// ObservabilityConfig controls the OpenTelemetry-compatible observability layer.
+type ObservabilityConfig struct {
+	// Exporter selects the export backend: "stdout" | "otlp" | "nop"
+	Exporter string `toml:"exporter"`
+	// OTLPEndpoint is the gRPC/HTTP endpoint for OTLP export.
+	OTLPEndpoint string `toml:"otlp_endpoint"`
+	// ServiceName is the logical service name in traces/metrics.
+	ServiceName string `toml:"service_name"`
 }
 
 type HouseConfig struct {
@@ -32,6 +45,7 @@ type WhipConfig struct {
 	HeartbeatInterval string `toml:"heartbeat_interval"`
 	StuckThreshold    string `toml:"stuck_threshold"`
 	MaxRetries        int    `toml:"max_retries"`
+	MaxMinisters      int    `toml:"max_ministers"` // Maximum number of active ministers
 }
 
 type StorageConfig struct {
@@ -40,6 +54,96 @@ type StorageConfig struct {
 
 type DefaultsConfig struct {
 	Topology string `toml:"topology"`
+}
+
+// HotReloadableParams are the config parameters that can be hot-reloaded.
+type HotReloadableParams struct {
+	WhipInterval   string // whip.heartbeat_interval
+	StuckThreshold string // whip.stuck_threshold
+	MaxMinisters   int    // whip.max_ministers
+}
+
+// ConfigWatcher watches for config file changes.
+type ConfigWatcher struct {
+	watcher    *fsnotify.Watcher
+	configPath string
+	mu         sync.RWMutex
+	onChange   func(*HotReloadableParams)
+	stopCh     chan struct{}
+}
+
+// NewConfigWatcher creates a new config watcher.
+func NewConfigWatcher(configPath string, onChange func(*HotReloadableParams)) (*ConfigWatcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	cw := &ConfigWatcher{
+		watcher:    watcher,
+		configPath: configPath,
+		onChange:   onChange,
+		stopCh:     make(chan struct{}),
+	}
+
+	// Watch the config file's directory.
+	dir := filepath.Dir(configPath)
+	if err := watcher.Add(dir); err != nil {
+		watcher.Close()
+		return nil, err
+	}
+
+	return cw, nil
+}
+
+// Start begins watching for config changes.
+func (cw *ConfigWatcher) Start() {
+	go func() {
+		for {
+			select {
+			case <-cw.stopCh:
+				return
+			case event, ok := <-cw.watcher.Events:
+				if !ok {
+					return
+				}
+				// Only react to writes to the config file.
+				if event.Op&fsnotify.Write == fsnotify.Write && event.Name == cw.configPath {
+					cw.reload()
+				}
+			case err, ok := <-cw.watcher.Errors:
+				if !ok {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "config watcher error: %v\n", err)
+			}
+		}
+	}()
+}
+
+// reload reads the config and triggers the onChange callback.
+func (cw *ConfigWatcher) reload() {
+	cfg, err := LoadConfig(filepath.Dir(filepath.Dir(cw.configPath)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to reload config: %v\n", err)
+		return
+	}
+
+	params := &HotReloadableParams{
+		WhipInterval:   cfg.Whip.HeartbeatInterval,
+		StuckThreshold: cfg.Whip.StuckThreshold,
+		MaxMinisters:   cfg.Whip.MaxMinisters,
+	}
+
+	if cw.onChange != nil {
+		cw.onChange(params)
+	}
+}
+
+// Stop stops the config watcher.
+func (cw *ConfigWatcher) Stop() {
+	close(cw.stopCh)
+	cw.watcher.Close()
 }
 
 func DefaultConfig(homeDir string) *Config {
@@ -57,12 +161,18 @@ func DefaultConfig(homeDir string) *Config {
 			HeartbeatInterval: "10s",
 			StuckThreshold:    "5m",
 			MaxRetries:        2,
+			MaxMinisters:      10, // Default max active ministers
 		},
 		Storage: StorageConfig{
 			DBPath: ".hoc/state.db",
 		},
 		Defaults: DefaultsConfig{
 			Topology: "parallel",
+		},
+		Observability: ObservabilityConfig{
+			Exporter:     "nop",
+			ServiceName:  "house-of-cards",
+			OTLPEndpoint: "localhost:4317",
 		},
 	}
 }

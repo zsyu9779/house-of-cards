@@ -10,11 +10,11 @@ import (
 )
 
 type Chamber struct {
-	Name      string
-	Path      string
-	Minister  string
-	MainRepo  string
-	Branch    string
+	Name     string
+	Path     string
+	Minister string
+	MainRepo string
+	Branch   string
 }
 
 // NewChamber creates a new worktree chamber for a Minister
@@ -28,11 +28,11 @@ func NewChamber(homeDir, projectName, ministerID, mainRepo string) (*Chamber, er
 	branchName := fmt.Sprintf("minister/%s", ministerID)
 
 	return &Chamber{
-		Name:      ministerID,
-		Path:      worktreePath,
-		Minister:  ministerID,
-		MainRepo:  mainRepo,
-		Branch:    branchName,
+		Name:     ministerID,
+		Path:     worktreePath,
+		Minister: ministerID,
+		MainRepo: mainRepo,
+		Branch:   branchName,
 	}, nil
 }
 
@@ -45,7 +45,7 @@ func (c *Chamber) Create() error {
 
 	// Create worktree
 	cmd := exec.Command("git", "worktree", "add", c.Path, "-b", c.Branch)
-	cmd.Dir = filepath.Dir(c.MainRepo)
+	cmd.Dir = c.MainRepo
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("create worktree: %w, output: %s", err, string(output))
 	}
@@ -63,7 +63,7 @@ func (c *Chamber) Remove() error {
 
 	// Delete branch
 	cmd = exec.Command("git", "branch", "-D", c.Branch)
-	cmd.Dir = filepath.Dir(c.MainRepo)
+	cmd.Dir = c.MainRepo
 	if output, err := cmd.CombinedOutput(); err != nil {
 		// Non-fatal - branch might not exist
 		fmt.Printf("warning: could not delete branch: %s\n", string(output))
@@ -141,7 +141,7 @@ func (c *Chamber) GetWorktreePath() string {
 // ListChambers lists all chambers in a project
 func ListChambers(homeDir, projectName string) ([]*Chamber, error) {
 	chambersDir := filepath.Join(homeDir, "projects", projectName, "chambers")
-	
+
 	entries, err := os.ReadDir(chambersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
