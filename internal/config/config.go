@@ -5,10 +5,111 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/fsnotify/fsnotify"
 )
+
+// ValidationError wraps multiple config validation failures.
+type ValidationError struct {
+	Errors []string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("config validation failed (%d errors):\n  - %s",
+		len(e.Errors), strings.Join(e.Errors, "\n  - "))
+}
+
+// Validate checks all config fields for correctness.
+// Returns a ValidationError containing all failures (not just the first).
+func (c *Config) Validate() error {
+	var errs []string
+
+	// --- Whip durations ---
+	if c.Whip.HeartbeatInterval != "" {
+		if _, err := time.ParseDuration(c.Whip.HeartbeatInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("whip.heartbeat_interval: invalid duration %q: %v",
+				c.Whip.HeartbeatInterval, err))
+		}
+	}
+
+	if c.Whip.StuckThreshold != "" {
+		d, err := time.ParseDuration(c.Whip.StuckThreshold)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("whip.stuck_threshold: invalid duration %q: %v",
+				c.Whip.StuckThreshold, err))
+		} else if d < 30*time.Second {
+			errs = append(errs, fmt.Sprintf("whip.stuck_threshold: %v is too small (minimum 30s)", d))
+		}
+	}
+
+	// --- Heartbeat vs Stuck relationship ---
+	if c.Whip.HeartbeatInterval != "" && c.Whip.StuckThreshold != "" {
+		hb, err1 := time.ParseDuration(c.Whip.HeartbeatInterval)
+		st, err2 := time.ParseDuration(c.Whip.StuckThreshold)
+		if err1 == nil && err2 == nil && st <= hb*3 {
+			errs = append(errs, fmt.Sprintf(
+				"whip.stuck_threshold (%v) should be > 3x heartbeat_interval (%v)",
+				st, hb))
+		}
+	}
+
+	// --- Whip numeric ranges ---
+	if c.Whip.MaxMinisters <= 0 {
+		errs = append(errs, fmt.Sprintf("whip.max_ministers: must be > 0, got %d",
+			c.Whip.MaxMinisters))
+	}
+
+	if c.Whip.MaxRetries < 0 {
+		errs = append(errs, fmt.Sprintf("whip.max_retries: must be >= 0, got %d",
+			c.Whip.MaxRetries))
+	}
+
+	if c.Whip.ScaleUpThreshold <= 0 {
+		errs = append(errs, fmt.Sprintf("whip.scale_up_threshold: must be > 0, got %d",
+			c.Whip.ScaleUpThreshold))
+	}
+
+	if c.Whip.ScaleDownThreshold <= 0 {
+		errs = append(errs, fmt.Sprintf("whip.scale_down_threshold: must be > 0, got %d",
+			c.Whip.ScaleDownThreshold))
+	}
+
+	// --- Storage ---
+	if c.Storage.DBPath == "" {
+		errs = append(errs, "storage.db_path: must not be empty")
+	}
+
+	// --- Observability ---
+	validExporters := map[string]bool{"stdout": true, "otlp": true, "nop": true}
+	if c.Observability.Exporter != "" && !validExporters[c.Observability.Exporter] {
+		errs = append(errs, fmt.Sprintf(
+			"observability.exporter: %q is not valid (choose: stdout, otlp, nop)",
+			c.Observability.Exporter))
+	}
+
+	// --- Home directory ---
+	if c.Home != "" {
+		if fi, err := os.Stat(c.Home); err != nil {
+			errs = append(errs, fmt.Sprintf("home directory %q: %v", c.Home, err))
+		} else if !fi.IsDir() {
+			errs = append(errs, fmt.Sprintf("home %q is not a directory", c.Home))
+		}
+	}
+
+	// --- Doctor ---
+	if c.Doctor.DBSizeWarnMB <= 0 {
+		errs = append(errs, fmt.Sprintf("doctor.db_size_warn_mb: must be > 0, got %d",
+			c.Doctor.DBSizeWarnMB))
+	}
+
+	if len(errs) > 0 {
+		return &ValidationError{Errors: errs}
+	}
+	return nil
+}
 
 type Config struct {
 	Home          string              `toml:"-"`
@@ -201,6 +302,9 @@ func LoadConfig(homeDir string) (*Config, error) {
 
 	_, err := os.Stat(configPath)
 	if os.IsNotExist(err) {
+		if err := cfg.Validate(); err != nil {
+			return nil, fmt.Errorf("default config invalid: %w", err)
+		}
 		return cfg, nil
 	}
 
@@ -210,6 +314,9 @@ func LoadConfig(homeDir string) (*Config, error) {
 	}
 
 	cfg.Home = homeDir
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", configPath, err)
+	}
 	return cfg, nil
 }
 

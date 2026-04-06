@@ -108,7 +108,7 @@ func registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
 	// API v1 routes.
@@ -169,7 +169,11 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 		// Build projects JSON.
 		projectsJSON := "[]"
 		if len(req.Projects) > 0 {
-			b, _ := json.Marshal(req.Projects)
+			b, err := json.Marshal(req.Projects)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid projects: "+err.Error())
+				return
+			}
 			projectsJSON = string(b)
 		}
 
@@ -214,7 +218,11 @@ func handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		bills, _ := db.ListBillsBySession(id)
+		bills, err := db.ListBillsBySession(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, map[string]interface{}{
 			"session": sess,
 			"bills":   bills,
@@ -280,7 +288,9 @@ func handleMinisterAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			_ = db.RecordEvent("minister.summoned", "api", req.BillID, ministerID, "", "")
+			if err := db.RecordEvent("minister.summoned", "api", req.BillID, ministerID, "", ""); err != nil {
+				slog.Warn("failed to record event", "minister_id", ministerID, "err", err)
+			}
 
 			writeJSON(w, map[string]string{
 				"status":      "summoned",
@@ -343,7 +353,10 @@ func handleBillAction(w http.ResponseWriter, r *http.Request) {
 				Notes    string  `json:"notes"`
 				Duration int     `json:"duration"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&req)
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+				return
+			}
 
 			b, err := db.GetBill(billID)
 			if err != nil {
@@ -367,7 +380,9 @@ func handleBillAction(w http.ResponseWriter, r *http.Request) {
 					Quality:    req.Quality,
 					Notes:      store.NullString(req.Notes),
 				}
-				_ = db.CreateHansard(h)
+				if err := db.CreateHansard(h); err != nil {
+					slog.Warn("failed to create hansard", "bill_id", billID, "err", err)
+				}
 			}
 
 			summary := fmt.Sprintf("议案 [%s] \"%s\" 已通过（Enacted）", billID, b.Title)
@@ -381,7 +396,9 @@ func handleBillAction(w http.ResponseWriter, r *http.Request) {
 				Type:         store.NullString("completion"),
 				Summary:      summary,
 			}
-			_ = db.CreateGazette(g)
+			if err := db.CreateGazette(g); err != nil {
+				slog.Warn("failed to create gazette", "bill_id", billID, "err", err)
+			}
 
 			writeJSON(w, map[string]string{
 				"status":  "enacted",
@@ -451,7 +468,9 @@ func handleWebhooks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		_ = db.RecordEvent("webhook.received", "api", "", "", "", "")
+		if err := db.RecordEvent("webhook.received", "api", "", "", "", ""); err != nil {
+			slog.Warn("failed to record webhook event", "err", err)
+		}
 
 		eventType := r.Header.Get("X-GitHub-Event")
 		switch eventType {
@@ -469,8 +488,13 @@ func handleWebhooks(w http.ResponseWriter, r *http.Request) {
 						Status:    "draft",
 						DependsOn: store.NullString("[]"),
 					}
-					_ = db.CreateBill(b)
-					_ = db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"push"}`)
+					if err := db.CreateBill(b); err != nil {
+						writeError(w, http.StatusInternalServerError, "failed to create bill: "+err.Error())
+						return
+					}
+					if err := db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"push"}`); err != nil {
+						slog.Warn("failed to record event", "bill_id", billID, "err", err)
+					}
 				}
 			}
 
@@ -493,8 +517,13 @@ func handleWebhooks(w http.ResponseWriter, r *http.Request) {
 				Status:      "draft",
 				DependsOn:   store.NullString("[]"),
 			}
-			_ = db.CreateBill(b)
-			_ = db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"pull_request"}`)
+			if err := db.CreateBill(b); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to create bill: "+err.Error())
+				return
+			}
+			if err := db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"pull_request"}`); err != nil {
+				slog.Warn("failed to record event", "bill_id", billID, "err", err)
+			}
 
 			writeJSON(w, map[string]string{
 				"status":  "processed",

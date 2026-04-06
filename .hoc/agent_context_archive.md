@@ -1,5 +1,20 @@
 # Agent Context Archive
 
+## 2026-04-06 — v0.3 Phase 1 PR-2 完成记录
+
+### PR-2: E-1.1 Whip 错误治理 + 恢复梯度
+- Store 层：Minister struct 新增 `RecoveryAttempts`，migrate 新增 ALTER TABLE
+- 所有 7 个 minister SELECT/Scan 更新为包含 `COALESCE(recovery_attempts,0)`
+- 新增 `IncrementRecoveryAttempts()` 和 `ResetRecoveryAttempts()` 方法
+- liveness.go：三级恢复梯度（checkpoint → at-risk → by-election）
+- poller.go：16 处错误修复（关键路径 return，辅助路径 slog.Warn，文件清理 best-effort）
+- scheduler.go：14 处错误修复（UpdateSessionStatus → critical+return）
+- dispatch.go：best-effort 注释
+- 验证：golangci-lint 零 error，go build/vet/test -race 全通过
+- `grep '_ = w.db.' internal/whip/` = 0 匹配
+
+---
+
 ## 2026-03-01 — 深度评估 + 巡检修复 + v0.2 草案
 
 ### 深度评估 + 文档归档
