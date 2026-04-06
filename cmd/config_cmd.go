@@ -8,13 +8,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// configCmd represents the config command
+// configCmd represents the config command.
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "配置管理",
 	Long:  "查看和重新加载配置",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
@@ -89,6 +89,7 @@ var configShowCmd = &cobra.Command{
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	configCmd.AddCommand(configReloadCmd)
 	configCmd.AddCommand(configShowCmd)

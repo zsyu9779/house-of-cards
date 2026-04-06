@@ -12,13 +12,14 @@ import (
 )
 
 var (
-	Version   = "0.1.0"
+	Version   = "0.2.0"
 	GitCommit = "dev"
+	BuildTime = "unknown"
 	verbose   bool
 	quiet     bool
 )
 
-// rootCmd represents the base command
+// rootCmd represents the base command.
 var rootCmd = &cobra.Command{
 	Use:   "hoc",
 	Short: "House of Cards - AI Agent 协作框架",
@@ -30,7 +31,7 @@ var rootCmd = &cobra.Command{
   Whip（党鞭）- 系统推进力
   Gazette（公报）- 信息凝练层
   Hansard（议事录）- 审计记录`,
-	Version:           fmt.Sprintf("%s (%s)", Version, GitCommit),
+	Version:           fmt.Sprintf("%s (%s, %s)", Version, GitCommit, BuildTime),
 	PersistentPreRunE: initLogging,
 }
 
@@ -65,7 +66,7 @@ func initLogging(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-// Execute adds all child commands to the root command
+// Execute adds all child commands to the root command.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -73,6 +74,7 @@ func Execute() {
 	}
 }
 
+//nolint:gochecknoinits // Cobra convention: register flags in init().
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "启用详细日志输出（DEBUG 级别）")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "静默模式，只输出错误（ERROR 级别）")
@@ -92,4 +94,5 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(formulaCmd)
 	rootCmd.AddCommand(eventsCmd)
+	rootCmd.AddCommand(versionCmd)
 }

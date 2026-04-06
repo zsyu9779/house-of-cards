@@ -135,13 +135,21 @@ func TestListChambers_WithSubdirs(t *testing.T) {
 		t.Fatalf("create chambers dir: %v", err)
 	}
 
-	// Create some chamber directories
-	os.MkdirAll(filepath.Join(chambersDir, "backend-claude"), 0755)
-	os.MkdirAll(filepath.Join(chambersDir, "frontend-cursor"), 0755)
-	os.MkdirAll(filepath.Join(chambersDir, "reviewer"), 0755)
+	// Create some chamber directories.
+	if err := os.MkdirAll(filepath.Join(chambersDir, "backend-claude"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(chambersDir, "frontend-cursor"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(chambersDir, "reviewer"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 
-	// Create a file (should be ignored)
-	os.WriteFile(filepath.Join(chambersDir, "README.md"), []byte("test"), 0644)
+	// Create a file (should be ignored).
+	if err := os.WriteFile(filepath.Join(chambersDir, "README.md"), []byte("test"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
 
 	chambers, err := ListChambers(tmpDir, "testproj")
 	if err != nil {
@@ -175,11 +183,13 @@ func TestListChambers_FileInChambers(t *testing.T) {
 		t.Fatalf("create chambers dir: %v", err)
 	}
 
-	// Create chamber directory
-	os.MkdirAll(filepath.Join(chambersDir, "chamber1"), 0755)
-
-	// Create a file with the same name (should not be treated as chamber)
-	os.MkdirAll(filepath.Join(chambersDir, "chamber2"), 0755)
+	// Create chamber directories.
+	if err := os.MkdirAll(filepath.Join(chambersDir, "chamber1"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(chambersDir, "chamber2"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 
 	chambers, err := ListChambers(tmpDir, "testproj")
 	if err != nil {

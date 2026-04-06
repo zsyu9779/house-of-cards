@@ -227,7 +227,7 @@ func printFormulaResult(result *formula.RunResult) {
 	}
 }
 
-// init registers formula subcommands.
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	formulaApplyCmd.Flags().BoolVar(&formulaDryRun, "dry-run", false, "预览执行步骤，不实际运行")
 	formulaApplyCmd.Flags().StringArrayVar(&formulaVars, "var", nil, "模板变量 key=value（可多次指定）")

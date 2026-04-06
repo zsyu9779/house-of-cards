@@ -50,16 +50,17 @@ func initDB() error {
 	return nil
 }
 
-// ministersCmd represents the ministers command
+// ministersCmd represents the ministers command.
 var ministersCmd = &cobra.Command{
 	Use:   "minister",
 	Short: "管理 Minister（部长）",
 	Long:  "Minister 管理命令：任命、传召、休会、查看",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	ministersCmd.AddCommand(ministerAppointCmd)
 	ministersCmd.AddCommand(ministerSummonCmd)
@@ -68,6 +69,7 @@ func init() {
 	ministersCmd.AddCommand(ministerByElectionCmd)
 	ministersCmd.AddCommand(ministerAutoCmd)
 	ministersCmd.AddCommand(ministerHookCmd)
+	ministersCmd.AddCommand(ministerRecoverCmd)
 
 	ministerAppointCmd.Flags().String("runtime", "claude-code", "Runtime: claude-code, codex, cursor")
 	ministerAppointCmd.Flags().StringSlice("portfolio", []string{}, "技能领域")
@@ -195,6 +197,16 @@ var ministerSummonCmd = &cobra.Command{
 			fmt.Printf("⚙  复用现有议事厅: %s\n", ch.GetWorktreePath())
 		}
 
+		// Write CLAUDE.md to chamber (Phase 2: ACK protocol).
+		claudePath := filepath.Join(ch.GetWorktreePath(), ".claude", "CLAUDE.md")
+		if err := os.MkdirAll(filepath.Dir(claudePath), 0755); err != nil {
+			return fmt.Errorf("create .claude dir: %w", err)
+		}
+		claudeContent := buildMinisterCLAUDE(minister, bill, ch.GetBranchName())
+		if err := os.WriteFile(claudePath, []byte(claudeContent), 0644); err != nil {
+			return fmt.Errorf("write CLAUDE.md: %w", err)
+		}
+
 		// Build bill brief.
 		brief := buildBillBrief(minister, bill, ch.GetBranchName())
 
@@ -204,11 +216,8 @@ var ministerSummonCmd = &cobra.Command{
 			var sb strings.Builder
 			sb.WriteString("\n## 上游公报（来自前序部长）\n\n")
 			for _, g := range upstreamGazettes {
-				sb.WriteString(fmt.Sprintf("**[%s]** %s:\n\n%s\n\n---\n\n",
-					g.Type.String,
-					orDash(g.FromMinister.String),
-					g.Summary,
-				))
+				sb.WriteString(formatUpstreamGazette(g))
+				sb.WriteString("\n---\n\n")
 			}
 			brief += sb.String()
 		}
@@ -453,6 +462,49 @@ var ministerByElectionCmd = &cobra.Command{
 	},
 }
 
+// ─── Phase 3: D-3 Minister Recover ──────────────────────────────────────────
+
+var ministerRecoverCmd = &cobra.Command{
+	Use:   "recover [minister-id]",
+	Short: "恢复 stuck 部长为 idle 状态",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ministerID := args[0]
+		m, err := db.GetMinister(ministerID)
+		if err != nil {
+			return fmt.Errorf("minister not found: %s", ministerID)
+		}
+
+		if m.Status != "stuck" {
+			return fmt.Errorf("部长状态为 [%s]，只有 stuck 状态的部长可恢复", m.Status)
+		}
+
+		if err := db.UpdateMinisterStatus(ministerID, "idle"); err != nil {
+			return fmt.Errorf("update status: %w", err)
+		}
+
+		_ = db.RecordEvent("governance.minister_recovered", "cli", "", ministerID, "", "")
+
+		summary := fmt.Sprintf("治理公报：部长 [%s] %s 已从 stuck 恢复为 idle。", ministerID, m.Title)
+		g := &store.Gazette{
+			ID:           shortID("gazette"),
+			ToMinister:   store.NullString(ministerID),
+			Type:         store.NullString("handoff"),
+			Summary:      summary,
+			FromMinister: store.NullString("governance"),
+		}
+		_ = db.CreateGazette(g)
+
+		fmt.Printf("✅ 部长 [%s] %s 已恢复（stuck → idle）\n", ministerID, m.Title)
+		return nil
+	},
+}
+
 // ─── minister auto (8-4) ─────────────────────────────────────────────────────
 
 // ministerAutoCmd continuously monitors active sessions and auto-summons ministers
@@ -605,6 +657,16 @@ func doSummon(db *store.DB, hocDir, ministerID, billID, projectName string, useT
 		}
 	}
 
+	// Write CLAUDE.md to chamber (Phase 2: ACK protocol).
+	claudePath := filepath.Join(ch.GetWorktreePath(), ".claude", "CLAUDE.md")
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0755); err != nil {
+		return fmt.Errorf("create .claude dir: %w", err)
+	}
+	claudeContent := buildMinisterCLAUDE(minister, bill, ch.GetBranchName())
+	if err := os.WriteFile(claudePath, []byte(claudeContent), 0644); err != nil {
+		return fmt.Errorf("write CLAUDE.md: %w", err)
+	}
+
 	brief := buildBillBrief(minister, bill, ch.GetBranchName())
 
 	upstreamGazettes, _ := db.ListGazettesForBill(billID)
@@ -612,11 +674,8 @@ func doSummon(db *store.DB, hocDir, ministerID, billID, projectName string, useT
 		var sb strings.Builder
 		sb.WriteString("\n## 上游公报（来自前序部长）\n\n")
 		for _, g := range upstreamGazettes {
-			sb.WriteString(fmt.Sprintf("**[%s]** %s:\n\n%s\n\n---\n\n",
-				g.Type.String,
-				orDash(g.FromMinister.String),
-				g.Summary,
-			))
+			sb.WriteString(formatUpstreamGazette(g))
+			sb.WriteString("\n---\n\n")
 		}
 		brief += sb.String()
 	}
@@ -770,6 +829,164 @@ func buildBillBrief(minister *store.Minister, bill *store.Bill, branch string) s
 	)
 }
 
+// buildMinisterCLAUDE creates the CLAUDE.md file content for a minister's chamber.
+// This file provides the minister with instructions on how to complete work and interact
+// with the Gazette ACK protocol.
+func buildMinisterCLAUDE(minister *store.Minister, bill *store.Bill, branch string) string {
+	today := time.Now().Format("2006-01-02")
+
+	return fmt.Sprintf(`# CLAUDE.md — Minister 工作规范
+
+> 这是 House of Cards 多 Agent 协作框架的工作规范。
+> 请仔细阅读并遵循。
+
+---
+
+## 当前任务
+
+- **议案 ID**: `+"`%s`"+`
+- **标题**: %s
+- **工作分支**: `+"`%s`"+`
+- **日期**: %s
+
+---
+
+## 必须完成的工作
+
+1. 专注完成上述议案，不要做额外的事情
+2. 提交所有代码变更
+
+---
+
+## 完成信号（必须）
+
+完成工作后，你**必须**写入完成信号文件：
+
+`+"```bash"+`
+mkdir -p .hoc
+cat > .hoc/bill-%s.done << 'EOF'
+summary = "简要描述完成的工作（1-2句话）"
+
+[contracts]
+# 下游部长需要知道的接口/契约
+# 例如: "api.go" = "新增 UserService 接口"
+"example.go" = "描述"
+
+[artifacts]
+# 新增或修改的文件
+# 例如: "internal/handler.go" = "新增"
+"file.go" = "新增/修改"
+
+[assumptions]
+# 关键假设或风险
+# 例如: "api-version" = "假设下游使用 v2 API"
+key = "assumption"
+EOF
+`+"```"+`
+
+**重要**：
+- 必须使用 **TOML 格式**（如上所示）
+- 必须写入 `+"`.hoc/bill-{bill-id}.done`"+` 文件
+- Whip 会自动检测此文件并将议案标记为 enacted
+
+---
+
+## 公报模板
+
+完成工作后，请在 `+"`gazettes/%s.md`"+` 创建公报：
+
+`+"```markdown"+`
+# Gazette: completion
+> From: %s | Bill: %s | Date: %s
+
+## 决议
+[3 句话以内描述你完成了什么]
+
+## 变更清单
+- `+"`file/path`"+` — 说明
+
+## 接口契约（下游部长需要知道的）
+[如有 API/接口，列出这里；否则写"无"]
+
+## 假设与风险
+[列出关键假设；否则写"无"]
+
+## 状态
+✅ Enacted | 测试通过 | 分支: %s
+`+"```"+`
+
+---
+
+## 公报签收协议（ACK Protocol）
+
+当你的议案有下游依赖者时：
+1. 你的完成公报会被投递到下游部长的 inbox
+2. 下游部长会读取你的公报并确认（ACK）
+3. 只有当**所有下游**都 ACK 后，你才会变为 idle 状态
+
+**禁止直接 push main 分支** — 所有变更通过 Gazette 传递。
+
+---
+
+## 质询机制（Question Time）
+
+如果下游部长对你的工作有疑问：
+1. 他们会创建 `+"`.hoc/bill-{id}.question`"+` 文件
+2. 你需要创建 `+"`.hoc/bill-{id}.answer`"+` 文件回复
+3. 最多 3 轮问答，超时后会自动升级
+
+---
+
+*请开始工作。*
+`,
+		bill.ID,
+		bill.Title,
+		branch,
+		today,
+		bill.ID,
+		bill.ID,
+		minister.Title,
+		bill.ID,
+		today,
+		branch,
+	)
+}
+
+// formatUpstreamGazette renders a single upstream gazette with structured payload if available.
+func formatUpstreamGazette(g *store.Gazette) string {
+	if g.Payload != "" {
+		var p store.DoneFilePayload
+		if err := json.Unmarshal([]byte(g.Payload), &p); err == nil &&
+			(p.Summary != "" || len(p.Contracts) > 0 || len(p.Artifacts) > 0 || len(p.Assumptions) > 0) {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("**[%s]** %s:\n\n", g.Type.String, orDash(g.FromMinister.String)))
+			if p.Summary != "" {
+				sb.WriteString(fmt.Sprintf("**摘要**: %s\n", p.Summary))
+			}
+			if len(p.Contracts) > 0 {
+				sb.WriteString("**接口契约**:\n")
+				for k, v := range p.Contracts {
+					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
+				}
+			}
+			if len(p.Artifacts) > 0 {
+				sb.WriteString("**产出物**:\n")
+				for k, v := range p.Artifacts {
+					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
+				}
+			}
+			if len(p.Assumptions) > 0 {
+				sb.WriteString("**假设**:\n")
+				for k, v := range p.Assumptions {
+					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
+				}
+			}
+			return sb.String()
+		}
+	}
+	return fmt.Sprintf("**[%s]** %s:\n\n%s\n\n", g.Type.String, orDash(g.FromMinister.String), g.Summary)
+}
+
 // ─── Phase 3B: Minister Hook Queue Commands ───────────────────────────────────
 
 // ministerHookCmd is the parent command for hook queue management.
@@ -781,7 +998,7 @@ var ministerHookCmd = &cobra.Command{
 
 这解决了 cabinet reshuffle 每个 Minister 只分配一份议案的限制。`,
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 

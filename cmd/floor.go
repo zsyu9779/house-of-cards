@@ -568,6 +568,7 @@ var floorCmd = &cobra.Command{
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register flags in init().
 func init() {
 	floorCmd.Flags().Int("interval", 3, "自动刷新间隔（秒）")
 }

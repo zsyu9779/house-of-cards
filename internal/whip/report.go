@@ -92,7 +92,7 @@ func Report(db *store.DB, showHistory bool) (string, error) {
 	if wstats.AvgDurationS > 0 {
 		avgStr = fmtSeconds(wstats.AvgDurationS)
 	}
-	sb.WriteString(fmt.Sprintf("📊 历史统计:\n"))
+	sb.WriteString("📊 历史统计:\n")
 	sb.WriteString(fmt.Sprintf("   补选次数 (By-elections): %d\n", wstats.ByElectionCount))
 	sb.WriteString(fmt.Sprintf("   平均完成时长:            %s\n", avgStr))
 	if len(wstats.StuckMinisters) > 0 {
@@ -166,11 +166,12 @@ func Report(db *store.DB, showHistory bool) (string, error) {
 		sb.WriteString("\n📜 最近事件日志 (Last 10 Hansard entries):\n")
 		sb.WriteString("─────────────────────────────────────────\n")
 		entries, err := db.ListRecentHansard(10)
-		if err != nil {
+		switch {
+		case err != nil:
 			sb.WriteString(fmt.Sprintf("  (获取失败: %v)\n", err))
-		} else if len(entries) == 0 {
+		case len(entries) == 0:
 			sb.WriteString("  (暂无记录)\n")
-		} else {
+		default:
 			for _, h := range entries {
 				outcomeIcon := "⚪"
 				switch h.Outcome.String {

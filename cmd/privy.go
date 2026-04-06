@@ -16,10 +16,11 @@ var privyCmd = &cobra.Command{
 	Short: "Privy Council（枢密院）— 合并仲裁",
 	Long:  "枢密院命令：将并行 Bills 的分支自动合并，处理冲突",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	privyCmd.AddCommand(privyMergeCmd)
 	privyCmd.AddCommand(privyAnalyzeCmd)
@@ -180,7 +181,7 @@ var privyMergeCmd = &cobra.Command{
 }
 
 // privyAnalyzeCmd performs a dry-run conflict analysis without actually merging.
-// Phase 3A — hoc privy analyze
+// Phase 3A — hoc privy analyze.
 var privyAnalyzeCmd = &cobra.Command{
 	Use:   "analyze <branch>",
 	Short: "分析分支合并冲突（干跑，不执行实际合并）",

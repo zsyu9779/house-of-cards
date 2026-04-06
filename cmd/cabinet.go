@@ -10,16 +10,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// cabinetCmd represents the cabinet command
+// cabinetCmd represents the cabinet command.
 var cabinetCmd = &cobra.Command{
 	Use:   "cabinet",
 	Short: "Cabinet（内阁）管理",
 	Long:  "内阁管理命令：查看、改组",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	cabinetCmd.AddCommand(cabinetListCmd)
 	cabinetCmd.AddCommand(cabinetReshuffleCmd)
@@ -223,7 +224,7 @@ var cabinetReshuffleCmd = &cobra.Command{
 
 // findBestMinisterWithLimit finds the best idle minister for a bill based on portfolio match
 // and success rate, while respecting the per-minister assignment limit.
-// Phase 3E — 负载均衡 + 批量分配
+// Phase 3E — 负载均衡 + 批量分配.
 func findBestMinisterWithLimit(bill *store.Bill, idle []*store.Minister, counts map[string]int, maxPerMinister int, db *store.DB) *store.Minister {
 	portfolio := bill.Portfolio.String
 
@@ -236,12 +237,13 @@ func findBestMinisterWithLimit(bill *store.Bill, idle []*store.Minister, counts 
 			continue
 		}
 
-		score := 0
-		if portfolio == "" {
+		var score int
+		switch {
+		case portfolio == "":
 			score = 1 // Any minister matches a bill with no portfolio requirement.
-		} else if ministerHasPortfolio(m.Skills, portfolio) {
+		case ministerHasPortfolio(m.Skills, portfolio):
 			score = 10
-		} else {
+		default:
 			continue // Skip ministers without matching skill.
 		}
 

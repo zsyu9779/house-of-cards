@@ -1,6 +1,7 @@
 package whip
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,11 +9,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/house-of-cards/hoc/internal/store"
 	"github.com/house-of-cards/hoc/internal/util"
 )
 
 // ─── Done File Polling (8-1) ─────────────────────────────────────────────────
+
+// parseDoneFile reads a .done file and parses it as TOML (structured) or plain text.
+// Returns the summary and the JSON-encoded payload (if TOML), or empty string if not TOML.
+func parseDoneFile(path string) (string, string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+
+	var payload store.DoneFilePayload
+	if _, err := toml.Decode(string(content), &payload); err != nil {
+		// Not TOML, treat as plain text summary.
+		return strings.TrimSpace(string(content)), ""
+	}
+
+	// TOML parsed successfully, serialize to JSON for storage.
+	payloadJSON, _ := json.Marshal(payload)
+	return payload.Summary, string(payloadJSON)
+}
 
 // pollDoneFiles scans each working minister's chamber for `.hoc/bill-<id>.done` files.
 // When found the corresponding bill is automatically enacted and a completion Gazette is created.
@@ -48,22 +69,23 @@ func (w *Whip) pollDoneFiles() {
 				continue
 			}
 
-			// Read optional summary from done file.
-			summaryBytes, _ := os.ReadFile(donePath)
-			summary := strings.TrimSpace(string(summaryBytes))
-			if summary == "" {
-				summary = fmt.Sprintf("议案 [%s] 已完成（无摘要）", bill.ID)
-			}
+			// Parse done file (TOML or plain text).
+			summary, payloadJSON := parseDoneFile(donePath)
 
 			slog.Info("检测到 done 文件，自动 enacted", "bill_id", bill.ID, "minister_id", m.ID)
-			if err := w.db.EnactBillFromDone(bill.ID, m.ID, summary); err != nil {
+			if err := w.db.EnactBillFromDone(bill.ID, m.ID, summary, payloadJSON); err != nil {
 				slog.Warn("pollDoneFiles: enact bill", "bill_id", bill.ID, "err", err)
 				continue
 			}
-			_ = w.db.RecordEvent("bill.enacted", "whip", bill.ID, m.ID, bill.SessionID.String, "")
+			if err := w.db.RecordEvent("bill.enacted", "whip", bill.ID, m.ID, bill.SessionID.String, ""); err != nil {
+				slog.Warn("记录 enacted 事件失败", "bill_id", bill.ID, "err", err)
+			}
+
+			// Phase 4: B-1.4 — Collect question time metrics for the hansard.
+			w.collectQuestionMetrics(bill.ID, m.ID)
 
 			// Remove done file to avoid re-processing.
-			_ = os.Remove(donePath)
+			_ = os.Remove(donePath) // best-effort: 清理 done 文件
 		}
 
 		// Check if minister has no more active bills → mark idle.
@@ -76,8 +98,11 @@ func (w *Whip) pollDoneFiles() {
 			}
 		}
 		if !hasActive {
-			_ = w.db.UpdateMinisterStatus(m.ID, "idle")
-			slog.Info("部长已完成所有议案，标记为 idle", "minister_id", m.ID)
+			if err := w.db.UpdateMinisterStatus(m.ID, "idle"); err != nil {
+				slog.Error("标记 idle 失败", "minister_id", m.ID, "err", err)
+			} else {
+				slog.Info("部长已完成所有议案，标记为 idle", "minister_id", m.ID)
+			}
 		}
 	}
 }
@@ -150,7 +175,9 @@ func (w *Whip) committeeAutomation() {
 		}
 
 		slog.Info("委员会自动分配", "bill_id", bill.ID, "reviewer_id", reviewer.ID)
-		_ = w.db.RecordEvent("committee.assigned", "whip", bill.ID, reviewer.ID, bill.SessionID.String, "")
+		if err := w.db.RecordEvent("committee.assigned", "whip", bill.ID, reviewer.ID, bill.SessionID.String, ""); err != nil {
+			slog.Warn("记录委员会分配事件失败", "bill_id", bill.ID, "err", err)
+		}
 
 		summary := fmt.Sprintf(
 			"委员会令：议案 [%s] \"%s\" 进入委员会审查阶段，已自动分配给 %s。\n"+
@@ -197,14 +224,24 @@ func (w *Whip) pollReviewFile(bill *store.Bill) {
 	pass := strings.HasPrefix(strings.ToUpper(text), "PASS")
 
 	if pass {
-		_ = w.db.UpdateBillStatus(bill.ID, "enacted")
+		if err := w.db.UpdateBillStatus(bill.ID, "enacted"); err != nil {
+			slog.Error("pollReviewFile: update bill status enacted", "bill_id", bill.ID, "err", err)
+			return
+		}
 	} else {
 		// Fail → reset to draft so Whip can reassign.
-		_ = w.db.UpdateBillStatus(bill.ID, "draft")
+		if err := w.db.UpdateBillStatus(bill.ID, "draft"); err != nil {
+			slog.Error("pollReviewFile: update bill status draft", "bill_id", bill.ID, "err", err)
+			return
+		}
 	}
-	_ = w.db.UnassignBill(bill.ID)
-	_ = w.db.UpdateMinisterStatus(reviewerID, "idle")
-	_ = os.Remove(reviewPath)
+	if err := w.db.UnassignBill(bill.ID); err != nil {
+		slog.Error("pollReviewFile: unassign bill", "bill_id", bill.ID, "err", err)
+	}
+	if err := w.db.UpdateMinisterStatus(reviewerID, "idle"); err != nil {
+		slog.Error("pollReviewFile: update minister status idle", "minister_id", reviewerID, "err", err)
+	}
+	_ = os.Remove(reviewPath) // best-effort: 清理 review 文件
 
 	outcome := "enacted"
 	icon := "✅"
@@ -213,7 +250,9 @@ func (w *Whip) pollReviewFile(bill *store.Bill) {
 		icon = "❌"
 	}
 	slog.Info("委员会审查结果", "bill_id", bill.ID, "pass", pass)
-	_ = w.db.RecordEvent("committee.result", "whip", bill.ID, reviewerID, bill.SessionID.String, fmt.Sprintf(`{"outcome":"%s"}`, outcome))
+	if err := w.db.RecordEvent("committee.result", "whip", bill.ID, reviewerID, bill.SessionID.String, fmt.Sprintf(`{"outcome":"%s"}`, outcome)); err != nil {
+		slog.Warn("记录委员会结果事件失败", "bill_id", bill.ID, "err", err)
+	}
 
 	reviewNotes := fmt.Sprintf("委员会审查: %s", util.Truncate(text, 120))
 	reviewQuality := store.ComputeBillQuality(outcome, reviewNotes)
@@ -225,7 +264,9 @@ func (w *Whip) pollReviewFile(bill *store.Bill) {
 		Quality:    reviewQuality,
 		Notes:      store.NullString(reviewNotes),
 	}
-	_ = w.db.CreateHansard(h)
+	if err := w.db.CreateHansard(h); err != nil {
+		slog.Warn("pollReviewFile: create hansard", "bill_id", bill.ID, "err", err)
+	}
 
 	g := &store.Gazette{
 		ID:           gazetteID(),
@@ -237,5 +278,109 @@ func (w *Whip) pollReviewFile(bill *store.Bill) {
 			bill.ID, icon, outcome, text,
 		),
 	}
-	_ = w.db.CreateGazette(g)
+	if err := w.db.CreateGazette(g); err != nil {
+		slog.Warn("pollReviewFile: create gazette", "bill_id", bill.ID, "err", err)
+	}
+}
+
+// ─── Phase 2: ACK Protocol ───────────────────────────────────────────────────
+
+// pollAckFiles checks for .ack files from downstream ministers.
+// When a minister is in "briefing" status (waiting for downstream ACK),
+// this polls for .ack files from downstream bills. If all downstream ACK,
+// the minister is marked as idle.
+func (w *Whip) pollAckFiles() {
+	// Get ministers in briefing status (waiting for downstream ACK).
+	ministers, err := w.db.ListMinistersWithStatus(store.MinisterStatusBriefing)
+	if err != nil {
+		slog.Warn("pollAckFiles: list briefing ministers", "err", err)
+		return
+	}
+
+	for _, m := range ministers {
+		worktree := m.Worktree.String
+		if worktree == "" {
+			continue
+		}
+
+		// Get bills assigned to this minister that are enacted.
+		bills, err := w.db.GetBillsByAssignee(m.ID)
+		if err != nil {
+			continue
+		}
+
+		allAcked := true
+		for _, bill := range bills {
+			if bill.Status != "enacted" && bill.Status != "royal_assent" {
+				continue
+			}
+
+			// Find downstream bills that depend on this bill.
+			downstream, err := w.db.GetDownstreamBills(bill.ID)
+			if err != nil || len(downstream) == 0 {
+				continue // No downstream bills.
+			}
+
+			// Check if all downstream have ACK'd.
+			for _, downBill := range downstream {
+				ackPath := filepath.Join(worktree, ".hoc", fmt.Sprintf("bill-%s.ack", downBill.ID))
+				if _, err := os.Stat(ackPath); os.IsNotExist(err) {
+					allAcked = false
+					break
+				}
+			}
+		}
+
+		if allAcked {
+			// All downstream ACK'd, mark minister as idle.
+			if err := w.db.UpdateMinisterStatus(m.ID, store.MinisterStatusIdle); err != nil {
+				slog.Error("pollAckFiles: update minister status idle", "minister_id", m.ID, "err", err)
+				continue
+			}
+			slog.Info("所有下游已 ACK，部长标记为 idle", "minister_id", m.ID)
+
+			// Clean up .ack files.
+			for _, bill := range bills {
+				ackPath := filepath.Join(worktree, ".hoc", fmt.Sprintf("bill-%s.ack", bill.ID))
+				_ = os.Remove(ackPath) // best-effort: 清理 ack 文件
+			}
+		}
+	}
+}
+
+// ─── Phase 4: B-1.4 Question Time Metrics ────────────────────────────────────
+
+// collectQuestionMetrics computes ACK rounds and briefing time for a bill's hansard.
+func (w *Whip) collectQuestionMetrics(billID, ministerID string) {
+	// Count question rounds.
+	ackRounds, err := w.db.CountACKRoundsForBill(billID)
+	if err != nil {
+		slog.Debug("collectQuestionMetrics: count ACK rounds", "bill_id", billID, "err", err)
+		return
+	}
+
+	// Compute briefing time from gazette timestamps.
+	briefingTimeS := 0
+	gazettes, err := w.db.ListGazettesForBill(billID)
+	if err == nil && len(gazettes) >= 2 {
+		// Briefing time = last gazette timestamp - first gazette timestamp.
+		first := gazettes[len(gazettes)-1].CreatedAt
+		last := gazettes[0].CreatedAt
+		briefingTimeS = int(last.Sub(first).Seconds())
+	}
+
+	// Find the hansard record for this bill + minister.
+	hansards, err := w.db.ListHansardByMinister(ministerID)
+	if err != nil {
+		return
+	}
+	for _, h := range hansards {
+		if h.BillID == billID {
+			if err := w.db.UpdateHansardMetrics(h.ID, ackRounds, briefingTimeS); err != nil {
+				slog.Warn("collectQuestionMetrics: update hansard metrics", "hansard_id", h.ID, "err", err)
+			}
+			slog.Debug("已更新 Hansard 度量", "hansard_id", h.ID, "ack_rounds", ackRounds, "briefing_s", briefingTimeS)
+			break
+		}
+	}
 }

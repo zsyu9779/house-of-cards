@@ -33,7 +33,7 @@ func TestBillIsReady_NoDeps(t *testing.T) {
 		DependsOn: store.NullString(""),
 	}
 	statusMap := map[string]string{}
-	if !w.billIsReady(bill, statusMap) {
+	if !w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill with no deps should always be ready")
 	}
 }
@@ -44,7 +44,7 @@ func TestBillIsReady_EmptyDepsArray(t *testing.T) {
 		ID:        "b1",
 		DependsOn: store.NullString("[]"),
 	}
-	if !w.billIsReady(bill, map[string]string{}) {
+	if !w.billIsReady(bill, map[string]string{}, store.AckModeNonBlocking) {
 		t.Error("bill with empty deps array should be ready")
 	}
 }
@@ -56,7 +56,7 @@ func TestBillIsReady_DepsEnacted(t *testing.T) {
 		DependsOn: store.NullString(`["b1"]`),
 	}
 	statusMap := map[string]string{"b1": "enacted"}
-	if !w.billIsReady(bill, statusMap) {
+	if !w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should be ready when dep is enacted")
 	}
 }
@@ -68,7 +68,7 @@ func TestBillIsReady_DepsRoyalAssent(t *testing.T) {
 		DependsOn: store.NullString(`["b1"]`),
 	}
 	statusMap := map[string]string{"b1": "royal_assent"}
-	if !w.billIsReady(bill, statusMap) {
+	if !w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should be ready when dep is royal_assent")
 	}
 }
@@ -80,7 +80,7 @@ func TestBillIsReady_DepsDraft(t *testing.T) {
 		DependsOn: store.NullString(`["b1"]`),
 	}
 	statusMap := map[string]string{"b1": "draft"}
-	if w.billIsReady(bill, statusMap) {
+	if w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should NOT be ready when dep is draft")
 	}
 }
@@ -95,7 +95,7 @@ func TestBillIsReady_MixedDeps(t *testing.T) {
 		"b1": "enacted",
 		"b2": "reading", // not done yet
 	}
-	if w.billIsReady(bill, statusMap) {
+	if w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should NOT be ready when any dep is still in progress")
 	}
 }
@@ -110,7 +110,7 @@ func TestBillIsReady_AllDepsEnacted(t *testing.T) {
 		"b1": "enacted",
 		"b2": "royal_assent",
 	}
-	if !w.billIsReady(bill, statusMap) {
+	if !w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should be ready when all deps are enacted/royal_assent")
 	}
 }
@@ -122,7 +122,7 @@ func TestBillIsReady_UnknownDep(t *testing.T) {
 		DependsOn: store.NullString(`["nonexistent"]`),
 	}
 	statusMap := map[string]string{}
-	if w.billIsReady(bill, statusMap) {
+	if w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("bill should NOT be ready when dep is not in statusMap")
 	}
 }
@@ -134,7 +134,7 @@ func TestBillIsReady_MalformedJSON(t *testing.T) {
 		DependsOn: store.NullString(`not-json`),
 	}
 	// Malformed JSON → treated as no dependencies → ready.
-	if !w.billIsReady(bill, map[string]string{}) {
+	if !w.billIsReady(bill, map[string]string{}, store.AckModeNonBlocking) {
 		t.Error("malformed JSON deps should be treated as no deps (ready)")
 	}
 }
@@ -152,21 +152,21 @@ func TestBillIsReady_ChainDependencies(t *testing.T) {
 
 	t.Run("both deps enacted", func(t *testing.T) {
 		statusMap := map[string]string{"a": "enacted", "b": "enacted"}
-		if !w.billIsReady(billC, statusMap) {
+		if !w.billIsReady(billC, statusMap, store.AckModeNonBlocking) {
 			t.Error("should be ready when all deps enacted")
 		}
 	})
 
 	t.Run("one dep in reading", func(t *testing.T) {
 		statusMap := map[string]string{"a": "enacted", "b": "reading"}
-		if w.billIsReady(billC, statusMap) {
+		if w.billIsReady(billC, statusMap, store.AckModeNonBlocking) {
 			t.Error("should NOT be ready when one dep is still reading")
 		}
 	})
 
 	t.Run("one dep missing from map", func(t *testing.T) {
 		statusMap := map[string]string{"a": "enacted"}
-		if w.billIsReady(billC, statusMap) {
+		if w.billIsReady(billC, statusMap, store.AckModeNonBlocking) {
 			t.Error("should NOT be ready when a dep is missing from statusMap")
 		}
 	})
@@ -181,7 +181,7 @@ func TestBillIsReady_RoyalAssentCountsAsDone(t *testing.T) {
 		DependsOn: store.NullString(`["upstream"]`),
 	}
 	statusMap := map[string]string{"upstream": "royal_assent"}
-	if !w.billIsReady(bill, statusMap) {
+	if !w.billIsReady(bill, statusMap, store.AckModeNonBlocking) {
 		t.Error("royal_assent should satisfy dependency (counts as done)")
 	}
 }

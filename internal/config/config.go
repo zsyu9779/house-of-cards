@@ -1,11 +1,10 @@
-// Package config provides configuration management for House of Cards
+// Package config provides configuration management for House of Cards.
 package config
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/BurntSushi/toml"
 	"github.com/fsnotify/fsnotify"
@@ -19,6 +18,13 @@ type Config struct {
 	Storage       StorageConfig       `toml:"storage"`
 	Defaults      DefaultsConfig      `toml:"defaults"`
 	Observability ObservabilityConfig `toml:"observability"`
+	Doctor        DoctorConfig        `toml:"doctor"`
+}
+
+// DoctorConfig controls doctor check thresholds.
+type DoctorConfig struct {
+	DBSizeWarnMB       int `toml:"db_size_warn_mb"`
+	GazetteBacklogWarn int `toml:"gazette_backlog_warn"`
 }
 
 // ObservabilityConfig controls the OpenTelemetry-compatible observability layer.
@@ -42,10 +48,12 @@ type SpeakerConfig struct {
 }
 
 type WhipConfig struct {
-	HeartbeatInterval string `toml:"heartbeat_interval"`
-	StuckThreshold    string `toml:"stuck_threshold"`
-	MaxRetries        int    `toml:"max_retries"`
-	MaxMinisters      int    `toml:"max_ministers"` // Maximum number of active ministers
+	HeartbeatInterval  string `toml:"heartbeat_interval"`
+	StuckThreshold     string `toml:"stuck_threshold"`
+	MaxRetries         int    `toml:"max_retries"`
+	MaxMinisters       int    `toml:"max_ministers"`        // Maximum number of active ministers
+	ScaleUpThreshold   int    `toml:"scale_up_threshold"`   // Pending bills > idle * threshold → scale up
+	ScaleDownThreshold int    `toml:"scale_down_threshold"` // Idle > pending + threshold → scale down
 }
 
 type StorageConfig struct {
@@ -58,16 +66,17 @@ type DefaultsConfig struct {
 
 // HotReloadableParams are the config parameters that can be hot-reloaded.
 type HotReloadableParams struct {
-	WhipInterval   string // whip.heartbeat_interval
-	StuckThreshold string // whip.stuck_threshold
-	MaxMinisters   int    // whip.max_ministers
+	WhipInterval       string // whip.heartbeat_interval
+	StuckThreshold     string // whip.stuck_threshold
+	MaxMinisters       int    // whip.max_ministers
+	ScaleUpThreshold   int    // whip.scale_up_threshold
+	ScaleDownThreshold int    // whip.scale_down_threshold
 }
 
 // ConfigWatcher watches for config file changes.
 type ConfigWatcher struct {
 	watcher    *fsnotify.Watcher
 	configPath string
-	mu         sync.RWMutex
 	onChange   func(*HotReloadableParams)
 	stopCh     chan struct{}
 }
@@ -130,9 +139,11 @@ func (cw *ConfigWatcher) reload() {
 	}
 
 	params := &HotReloadableParams{
-		WhipInterval:   cfg.Whip.HeartbeatInterval,
-		StuckThreshold: cfg.Whip.StuckThreshold,
-		MaxMinisters:   cfg.Whip.MaxMinisters,
+		WhipInterval:       cfg.Whip.HeartbeatInterval,
+		StuckThreshold:     cfg.Whip.StuckThreshold,
+		MaxMinisters:       cfg.Whip.MaxMinisters,
+		ScaleUpThreshold:   cfg.Whip.ScaleUpThreshold,
+		ScaleDownThreshold: cfg.Whip.ScaleDownThreshold,
 	}
 
 	if cw.onChange != nil {
@@ -158,10 +169,12 @@ func DefaultConfig(homeDir string) *Config {
 			Model:   "opus",
 		},
 		Whip: WhipConfig{
-			HeartbeatInterval: "10s",
-			StuckThreshold:    "5m",
-			MaxRetries:        2,
-			MaxMinisters:      10, // Default max active ministers
+			HeartbeatInterval:  "10s",
+			StuckThreshold:     "5m",
+			MaxRetries:         2,
+			MaxMinisters:       10, // Default max active ministers
+			ScaleUpThreshold:   2,  // pending > idle * 2 → scale up
+			ScaleDownThreshold: 2,  // idle > pending + 2 → scale down
 		},
 		Storage: StorageConfig{
 			DBPath: ".hoc/state.db",
@@ -173,6 +186,10 @@ func DefaultConfig(homeDir string) *Config {
 			Exporter:     "nop",
 			ServiceName:  "house-of-cards",
 			OTLPEndpoint: "localhost:4317",
+		},
+		Doctor: DoctorConfig{
+			DBSizeWarnMB:       100,
+			GazetteBacklogWarn: 50,
 		},
 	}
 }

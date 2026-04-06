@@ -40,7 +40,7 @@ type MergeResult struct {
 }
 
 // ConflictInfo holds structured information about a single conflicting file.
-// Phase 3A — 冲突理解增强
+// Phase 3A — 冲突理解增强.
 type ConflictInfo struct {
 	File     string // 冲突文件路径
 	Blocks   int    // 冲突块数量（<<<<<<< HEAD 计数）
@@ -207,7 +207,7 @@ func tryMergeWithStrategyChain(gitCmd func(...string) (string, error), bill Bill
 }
 
 // analyzeConflicts performs detailed conflict analysis on the merge output.
-// Phase 3A — 3A-1: 结构化冲突分析
+// Phase 3A — 3A-1: 结构化冲突分析.
 func analyzeConflicts(gitCmd func(...string) (string, error), theirBranch string, mergeOutput string) []ConflictInfo {
 	files := parseConflictFiles(mergeOutput)
 
@@ -262,7 +262,7 @@ func detectConflictType(output, file string) string {
 
 // AnalyzeBranch performs a dry-run merge analysis between the current HEAD and
 // a branch to predict conflicts before actually merging.
-// Phase 3A — 供 hoc privy analyze 命令使用
+// Phase 3A — 供 hoc privy analyze 命令使用.
 func AnalyzeBranch(mainRepo, branch, baseBranch string) ([]ConflictInfo, error) {
 	if _, err := os.Stat(mainRepo); err != nil {
 		return nil, fmt.Errorf("main repo not found: %s", mainRepo)
@@ -308,7 +308,7 @@ func AnalyzeBranch(mainRepo, branch, baseBranch string) ([]ConflictInfo, error) 
 
 // MainRepoFromWorktree infers the main repo path from a minister's worktree path.
 // Worktree pattern: <hocDir>/projects/<project>/chambers/<ministerID>
-// Main repo:        <hocDir>/projects/<project>/main
+// Main repo:        <hocDir>/projects/<project>/main.
 func MainRepoFromWorktree(worktree string) string {
 	// Walk up to "chambers" directory, then sibling "main".
 	dir := worktree

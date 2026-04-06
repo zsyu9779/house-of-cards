@@ -14,16 +14,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// speakerCmd represents the speaker command
+// speakerCmd represents the speaker command.
 var speakerCmd = &cobra.Command{
 	Use:   "speaker",
 	Short: "Speaker（议长）管理",
 	Long:  "议长管理命令：传召议长、查看议长备忘录、议长巡视、多议长竞标",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	speakerCmd.AddCommand(speakerSummonCmd)
 	speakerCmd.AddCommand(speakerContextCmd)
@@ -343,7 +344,7 @@ var speakerCouncilCmd = &cobra.Command{
 		if goal == "" {
 			// Read from stdin if not provided.
 			fmt.Print("请输入需要竞标的目标：")
-			fmt.Scanln(&goal)
+			_, _ = fmt.Scanln(&goal)
 		}
 		if goal == "" {
 			return fmt.Errorf("目标不能为空，请使用 --goal 指定")

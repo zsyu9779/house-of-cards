@@ -15,7 +15,7 @@ var projectCmd = &cobra.Command{
 	Short: "管理项目（Project）",
 	Long:  "项目管理命令：添加仓库、列出项目",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
@@ -114,6 +114,7 @@ var projectListCmd = &cobra.Command{
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	projectCmd.AddCommand(projectAddCmd)
 	projectCmd.AddCommand(projectListCmd)

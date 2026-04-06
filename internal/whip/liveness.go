@@ -29,7 +29,17 @@ func (w *Whip) threeLineWhip() {
 
 	for _, m := range working {
 		if w.isMinisterAlive(m) {
-			_ = w.db.UpdateMinisterHeartbeat(m.ID)
+			if err := w.db.UpdateMinisterHeartbeat(m.ID); err != nil {
+				slog.Warn("更新心跳失败", "minister_id", m.ID, "err", err)
+			}
+			// Recovery: reset attempts if minister recovered from stuck.
+			if m.RecoveryAttempts > 0 {
+				if err := w.db.ResetRecoveryAttempts(m.ID); err != nil {
+					slog.Warn("重置恢复计数失败", "minister_id", m.ID, "err", err)
+				} else {
+					slog.Info("部长已恢复，重置恢复计数", "minister_id", m.ID)
+				}
+			}
 			continue
 		}
 
@@ -39,12 +49,17 @@ func (w *Whip) threeLineWhip() {
 		}
 
 		// Beyond grace period → mark stuck (not byElection yet).
+		if err := w.db.UpdateMinisterStatus(m.ID, "stuck"); err != nil {
+			slog.Error("标记 stuck 失败，跳过本次检查", "minister_id", m.ID, "err", err)
+			continue
+		}
 		slog.Warn("部长无响应，标记为 stuck", "minister_id", m.ID)
-		_ = w.db.UpdateMinisterStatus(m.ID, "stuck")
-		_ = w.db.RecordEvent("minister.stuck", "whip", "", m.ID, "", fmt.Sprintf(`{"reason":"heartbeat_timeout"}`))
+		if err := w.db.RecordEvent("minister.stuck", "whip", "", m.ID, "", `{"reason":"heartbeat_timeout"}`); err != nil {
+			slog.Warn("记录 stuck 事件失败", "minister_id", m.ID, "err", err)
+		}
 	}
 
-	// Pass 2: check stuck ministers → byElection if stuck beyond stuckThreshold.
+	// Pass 2: stuck ministers → graduated recovery.
 	stuck, err := w.db.ListMinistersWithStatus("stuck")
 	if err != nil {
 		slog.Warn("threeLineWhip: list stuck ministers", "err", err)
@@ -57,8 +72,57 @@ func (w *Whip) threeLineWhip() {
 			continue
 		}
 
-		slog.Warn("部长 stuck 超时，触发补选", "minister_id", m.ID, "threshold", stuckThreshold)
-		w.byElection(m)
+		attempts, err := w.db.IncrementRecoveryAttempts(m.ID)
+		if err != nil {
+			slog.Error("恢复计数更新失败", "minister_id", m.ID, "err", err)
+			continue
+		}
+
+		switch {
+		case attempts <= 1:
+			// Level 1: send checkpoint reminder Gazette.
+			slog.Warn("部长 stuck，发送 checkpoint 提醒", "minister_id", m.ID, "attempt", attempts)
+			g := &store.Gazette{
+				ID:           gazetteID(),
+				ToMinister:   store.NullString(m.ID),
+				Type:         store.NullString("recovery"),
+				Summary:      fmt.Sprintf("党鞭提醒：检测到您可能卡住（第 %d 次）。请做 checkpoint 保存进度。如已恢复请忽略。", attempts),
+				FromMinister: store.NullString("whip"),
+			}
+			if err := w.db.CreateGazette(g); err != nil {
+				slog.Warn("创建恢复 Gazette 失败", "minister_id", m.ID, "err", err)
+			}
+
+		case attempts == 2:
+			// Level 2: mark bill at-risk + send warning Gazette.
+			slog.Warn("部长 stuck 持续，标记 at-risk", "minister_id", m.ID, "attempt", attempts)
+			bills, _ := w.db.GetBillsByAssignee(m.ID)
+			for _, bill := range bills {
+				if bill.Status == "reading" {
+					if err := w.db.RecordEvent("bill.at_risk", "whip", bill.ID, m.ID, bill.SessionID.String, ""); err != nil {
+						slog.Warn("记录 at-risk 事件失败", "bill_id", bill.ID, "err", err)
+					}
+				}
+			}
+			g := &store.Gazette{
+				ID:           gazetteID(),
+				ToMinister:   store.NullString(m.ID),
+				Type:         store.NullString("recovery"),
+				Summary:      fmt.Sprintf("党鞭警告：第 %d 次检测到您卡住。下一次检测将触发补选。请立即做 checkpoint 或 done。", attempts),
+				FromMinister: store.NullString("whip"),
+			}
+			if err := w.db.CreateGazette(g); err != nil {
+				slog.Warn("创建恢复 Gazette 失败", "minister_id", m.ID, "err", err)
+			}
+
+		default:
+			// Level 3: trigger byElection.
+			slog.Warn("部长 stuck 超限，触发补选", "minister_id", m.ID, "attempts", attempts)
+			w.byElection(m)
+			if err := w.db.ResetRecoveryAttempts(m.ID); err != nil {
+				slog.Warn("重置恢复计数失败", "minister_id", m.ID, "err", err)
+			}
+		}
 	}
 }
 
@@ -70,7 +134,9 @@ func (w *Whip) threeLineWhip() {
 //  5. Mark minister as offline
 func (w *Whip) byElection(m *store.Minister) {
 	whipMetrics.byElectionTotal.Inc()
-	_ = w.db.RecordEvent("by_election.triggered", "whip", "", m.ID, "", fmt.Sprintf(`{"minister":"%s"}`, m.ID))
+	if err := w.db.RecordEvent("by_election.triggered", "whip", "", m.ID, "", fmt.Sprintf(`{"minister":"%s"}`, m.ID)); err != nil {
+		slog.Warn("记录补选触发事件失败", "minister_id", m.ID, "err", err)
+	}
 
 	_, span := w.tracer.Start(context.Background(), "whip.by_election")
 	defer span.End()
@@ -161,7 +227,9 @@ func (w *Whip) byElection(m *store.Minister) {
 	}
 
 	slog.Info("补选完成", "minister_id", m.ID, "status", "offline")
-	_ = w.db.RecordEvent("by_election.completed", "whip", "", m.ID, "", fmt.Sprintf(`{"status":"offline"}`))
+	if err := w.db.RecordEvent("by_election.completed", "whip", "", m.ID, "", `{"status":"offline"}`); err != nil {
+		slog.Warn("记录补选完成事件失败", "minister_id", m.ID, "err", err)
+	}
 }
 
 // isMinisterAlive checks if the Minister's backing process is still running.

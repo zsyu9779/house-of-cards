@@ -1,4 +1,4 @@
-// Package chamber provides Git worktree management for Minister sandboxes
+// Package chamber provides Git worktree management for Minister sandboxes.
 package chamber
 
 import (
@@ -17,7 +17,7 @@ type Chamber struct {
 	Branch   string
 }
 
-// NewChamber creates a new worktree chamber for a Minister
+// NewChamber creates a new worktree chamber for a Minister.
 func NewChamber(homeDir, projectName, ministerID, mainRepo string) (*Chamber, error) {
 	chambersDir := filepath.Join(homeDir, "projects", projectName, "chambers")
 	if err := os.MkdirAll(chambersDir, 0755); err != nil {
@@ -36,7 +36,7 @@ func NewChamber(homeDir, projectName, ministerID, mainRepo string) (*Chamber, er
 	}, nil
 }
 
-// Create creates a new git worktree for this chamber
+// Create creates a new git worktree for this chamber.
 func (c *Chamber) Create() error {
 	// Check if worktree already exists
 	if _, err := os.Stat(c.Path); err == nil {
@@ -53,7 +53,7 @@ func (c *Chamber) Create() error {
 	return nil
 }
 
-// Remove removes the worktree
+// Remove removes the worktree.
 func (c *Chamber) Remove() error {
 	// Remove worktree
 	cmd := exec.Command("git", "worktree", "remove", "--force", c.Path)
@@ -72,7 +72,7 @@ func (c *Chamber) Remove() error {
 	return nil
 }
 
-// Status returns the status of the worktree
+// Status returns the status of the worktree.
 func (c *Chamber) Status() (string, error) {
 	cmd := exec.Command("git", "status", "--porcelain")
 	cmd.Dir = c.Path
@@ -83,7 +83,7 @@ func (c *Chamber) Status() (string, error) {
 	return string(output), nil
 }
 
-// HasUncommittedChanges returns true if there are uncommitted changes
+// HasUncommittedChanges returns true if there are uncommitted changes.
 func (c *Chamber) HasUncommittedChanges() (bool, error) {
 	status, err := c.Status()
 	if err != nil {
@@ -92,7 +92,7 @@ func (c *Chamber) HasUncommittedChanges() (bool, error) {
 	return strings.TrimSpace(status) != "", nil
 }
 
-// Stash saves uncommitted changes
+// Stash saves uncommitted changes.
 func (c *Chamber) Stash() error {
 	cmd := exec.Command("git", "stash", "push", "-m", fmt.Sprintf("chamber:%s:emergency-stash", c.Minister))
 	cmd.Dir = c.Path
@@ -102,7 +102,7 @@ func (c *Chamber) Stash() error {
 	return nil
 }
 
-// Commit commits staged changes
+// Commit commits staged changes.
 func (c *Chamber) Commit(message string) error {
 	cmd := exec.Command("git", "add", "-A")
 	cmd.Dir = c.Path
@@ -118,7 +118,7 @@ func (c *Chamber) Commit(message string) error {
 	return nil
 }
 
-// Push pushes the branch to remote
+// Push pushes the branch to remote.
 func (c *Chamber) Push() error {
 	cmd := exec.Command("git", "push", "-u", "origin", c.Branch)
 	cmd.Dir = c.Path
@@ -128,17 +128,17 @@ func (c *Chamber) Push() error {
 	return nil
 }
 
-// GetBranchName returns the branch name for this chamber
+// GetBranchName returns the branch name for this chamber.
 func (c *Chamber) GetBranchName() string {
 	return c.Branch
 }
 
-// GetWorktreePath returns the path to the worktree
+// GetWorktreePath returns the path to the worktree.
 func (c *Chamber) GetWorktreePath() string {
 	return c.Path
 }
 
-// ListChambers lists all chambers in a project
+// ListChambers lists all chambers in a project.
 func ListChambers(homeDir, projectName string) ([]*Chamber, error) {
 	chambersDir := filepath.Join(homeDir, "projects", projectName, "chambers")
 

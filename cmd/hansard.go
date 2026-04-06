@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/house-of-cards/hoc/internal/store"
 	"github.com/house-of-cards/hoc/internal/util"
 	"github.com/spf13/cobra"
 )
 
-// hansardCmd represents the hansard command
+// hansardCmd represents the hansard command.
 var hansardCmd = &cobra.Command{
 	Use:   "hansard [minister-id]",
 	Short: "Hansard（议事录）— 查看部长工作履历",
@@ -26,10 +27,12 @@ var hansardCmd = &cobra.Command{
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	hansardCmd.AddCommand(hansardListCmd)
 	hansardCmd.AddCommand(hansardTrendCmd)
 	hansardCmd.AddCommand(hansardScoreCmd)
+	hansardCmd.AddCommand(hansardMetricsCmd) // Phase 4: B-1.4
 	hansardTrendCmd.Flags().Int("last", 10, "分析最近 N 条 Hansard 记录（每位部长）")
 }
 
@@ -335,3 +338,162 @@ func formatDuration(seconds int) string {
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
+
+// ─── Phase 4: B-1.4 Hansard Metrics ────────────────────────────────────────
+
+var hansardMetricsCmd = &cobra.Command{
+	Use:   "metrics [session-id]",
+	Short: "显示质询度量（Question Time Metrics）",
+	Long:  "分析 ACK 轮次、首次 ACK 率和简报耗时。不指定 session-id 时显示全局数据。",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		fmt.Println("📊 质询度量 (Question Time Metrics)")
+		fmt.Println("═══════════════════════════════════")
+
+		if len(args) == 1 {
+			return showSessionMetrics(args[0])
+		}
+		return showGlobalMetrics()
+	},
+}
+
+func showSessionMetrics(sessionID string) error {
+	s, err := db.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	fmt.Printf("  会期: \"%s\" [%s]\n\n", s.Title, s.ID)
+
+	// First ACK rate.
+	firstACKRate, err := db.FirstACKRate(sessionID)
+	if err != nil {
+		return fmt.Errorf("first ACK rate: %w", err)
+	}
+
+	bills, _ := db.ListBillsBySession(sessionID)
+	enactedCount := 0
+	totalRounds := 0
+	totalBriefingS := 0
+	briefingCount := 0
+	for _, b := range bills {
+		if b.Status == "enacted" || b.Status == "royal_assent" {
+			enactedCount++
+			rounds, _ := db.CountACKRoundsForBill(b.ID)
+			totalRounds += rounds
+		}
+	}
+
+	// Compute briefing time from hansard.
+	hansards, _ := db.ListHansardBySession(sessionID)
+	for _, h := range hansards {
+		if h.BriefingTimeS > 0 {
+			totalBriefingS += h.BriefingTimeS
+			briefingCount++
+		}
+	}
+
+	zeroRounds := int(firstACKRate * float64(enactedCount))
+	fmt.Printf("  首次 ACK 率:    %d/%d (%.0f%%)\n", zeroRounds, enactedCount, firstACKRate*100)
+	if enactedCount > 0 {
+		fmt.Printf("  平均 ACK 轮次:  %.1f\n", float64(totalRounds)/float64(enactedCount))
+	}
+	if briefingCount > 0 {
+		avgBriefing := totalBriefingS / briefingCount
+		fmt.Printf("  平均简报耗时:   %s\n", formatDuration(avgBriefing))
+	}
+
+	// Per-minister metrics.
+	return showMinisterMetrics(sessionID)
+}
+
+func showGlobalMetrics() error {
+	ministers, err := db.ListMinisters()
+	if err != nil {
+		return fmt.Errorf("list ministers: %w", err)
+	}
+
+	if len(ministers) == 0 {
+		fmt.Println("  暂无部长数据。")
+		return nil
+	}
+
+	fmt.Println()
+	fmt.Println("  部长表现:")
+	for _, m := range ministers {
+		firstRate, _ := db.GetMinisterFirstACKRate(m.ID)
+		entries, _ := db.ListHansardByMinister(m.ID)
+		if len(entries) == 0 {
+			continue
+		}
+		totalRounds := 0
+		for _, h := range entries {
+			if h.Outcome.String == "enacted" {
+				rounds, _ := db.CountACKRoundsForBill(h.BillID)
+				totalRounds += rounds
+			}
+		}
+		enacted := 0
+		for _, h := range entries {
+			if h.Outcome.String == "enacted" {
+				enacted++
+			}
+		}
+		avgRounds := 0.0
+		if enacted > 0 {
+			avgRounds = float64(totalRounds) / float64(enacted)
+		}
+		fmt.Printf("  %-22s 首次ACK %.0f%%  平均轮次 %.1f\n",
+			truncate(m.Title, 22),
+			firstRate*100,
+			avgRounds,
+		)
+	}
+	return nil
+}
+
+func showMinisterMetrics(sessionID string) error {
+	hansards, _ := db.ListHansardBySession(sessionID)
+	if len(hansards) == 0 {
+		return nil
+	}
+
+	// Collect unique ministers.
+	seen := make(map[string]bool)
+	var ministerIDs []string
+	for _, h := range hansards {
+		if !seen[h.MinisterID] {
+			seen[h.MinisterID] = true
+			ministerIDs = append(ministerIDs, h.MinisterID)
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("  部长表现:")
+	for _, mid := range ministerIDs {
+		firstRate, _ := db.GetMinisterFirstACKRate(mid)
+		var totalRounds, enacted int
+		for _, h := range hansards {
+			if h.MinisterID == mid && h.Outcome.String == "enacted" {
+				enacted++
+				rounds, _ := db.CountACKRoundsForBill(h.BillID)
+				totalRounds += rounds
+			}
+		}
+		avgRounds := 0.0
+		if enacted > 0 {
+			avgRounds = float64(totalRounds) / float64(enacted)
+		}
+		fmt.Printf("  %-22s 首次ACK %.0f%%  平均轮次 %.1f\n",
+			truncate(mid, 22), firstRate*100, avgRounds)
+	}
+	return nil
+}
+
+// Ensure store import is used.
+var _ = store.GazetteQuestion

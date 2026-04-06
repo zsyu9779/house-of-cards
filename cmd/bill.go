@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/house-of-cards/hoc/internal/store"
@@ -12,16 +11,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// billCmd represents the bill command
+// billCmd represents the bill command.
 var billCmd = &cobra.Command{
 	Use:   "bill",
 	Short: "管理 Bill（议案）",
 	Long:  "议案管理命令：起草、分配、查看",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	billCmd.AddCommand(billListCmd)
 	billCmd.AddCommand(billShowCmd)
@@ -30,6 +30,9 @@ func init() {
 	billCmd.AddCommand(billEnactedCmd)
 	billCmd.AddCommand(billCommitteeCmd)
 	billCmd.AddCommand(billReviewCmd)
+	billCmd.AddCommand(billPauseCmd)
+	billCmd.AddCommand(billResumeCmd)
+	billCmd.AddCommand(billSplitCmd)
 
 	billListCmd.Flags().Bool("json", false, "以 JSON 格式输出")
 
@@ -48,6 +51,10 @@ func init() {
 	billReviewCmd.Flags().Bool("fail", false, "审查未通过（committee → reading，退回修改）")
 	billReviewCmd.Flags().String("notes", "", "委员会审查意见")
 	billReviewCmd.Flags().Float64("quality", 0, "质量评分 (0.0-1.0)")
+
+	billPauseCmd.Flags().String("reason", "", "暂停原因")
+	billSplitCmd.Flags().StringSlice("into", nil, "子议案标题列表（必填）")
+	_ = billSplitCmd.MarkFlagRequired("into")
 }
 
 var billListCmd = &cobra.Command{
@@ -515,14 +522,152 @@ var billReviewCmd = &cobra.Command{
 	},
 }
 
-// Add a helper to print billspec depends in readable format.
-func dependsOnStr(raw string) string {
-	if raw == "" || raw == "[]" {
-		return "-"
-	}
-	var deps []string
-	if err := json.Unmarshal([]byte(raw), &deps); err != nil {
-		return raw
-	}
-	return strings.Join(deps, ", ")
+// ─── Phase 3: D-3 Governance Commands ──────────────────────────────────────
+
+var billPauseCmd = &cobra.Command{
+	Use:   "pause [bill-id]",
+	Short: "暂停议案（→ draft，清除 assignee）",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		billID := args[0]
+		reason, _ := cmd.Flags().GetString("reason")
+
+		b, err := db.GetBill(billID)
+		if err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if b.Status == "enacted" || b.Status == "royal_assent" || b.Status == "failed" {
+			return fmt.Errorf("议案状态为 [%s]，终态议案不可暂停", b.Status)
+		}
+
+		prevStatus := b.Status
+		if err := db.UpdateBillStatus(billID, "draft"); err != nil {
+			return fmt.Errorf("update bill status: %w", err)
+		}
+		if err := db.ClearBillAssignment(billID); err != nil {
+			slog.Warn("clear bill assignment", "err", err)
+		}
+
+		payload := fmt.Sprintf(`{"prev_status":"%s","reason":"%s"}`, prevStatus, reason)
+		_ = db.RecordEvent("governance.bill_paused", "cli", billID, b.Assignee.String, b.SessionID.String, payload)
+
+		summary := fmt.Sprintf("治理公报：议案 [%s] \"%s\" 已暂停（%s → draft）。", billID, b.Title, prevStatus)
+		if reason != "" {
+			summary += " 原因：" + reason
+		}
+		g := &store.Gazette{
+			ID:      shortID("gazette"),
+			BillID:  store.NullString(billID),
+			Type:    store.NullString("handoff"),
+			Summary: summary,
+		}
+		_ = db.CreateGazette(g)
+
+		fmt.Printf("⏸  议案 [%s] \"%s\" 已暂停\n", billID, b.Title)
+		fmt.Printf("   状态: %s → draft  负责人: 已清除\n", prevStatus)
+		if reason != "" {
+			fmt.Printf("   原因: %s\n", reason)
+		}
+		return nil
+	},
 }
+
+var billResumeCmd = &cobra.Command{
+	Use:   "resume [bill-id]",
+	Short: "恢复已暂停的议案",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		billID := args[0]
+		b, err := db.GetBill(billID)
+		if err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if b.Status != "draft" {
+			return fmt.Errorf("议案状态为 [%s]，只有 draft 状态的议案可恢复", b.Status)
+		}
+
+		_ = db.RecordEvent("governance.bill_resumed", "cli", billID, "", b.SessionID.String, "")
+
+		fmt.Printf("▶  议案 [%s] \"%s\" 已恢复（状态: draft，可被 Whip 重新派发）\n", billID, b.Title)
+		return nil
+	},
+}
+
+// ─── Phase 3: B-3 Bill Split ───────────────────────────────────────────────
+
+var billSplitCmd = &cobra.Command{
+	Use:   "split [bill-id]",
+	Short: "拆分议案为多个子议案",
+	Long: `将一个议案拆分为多个子议案。原议案变为 epic 状态。
+
+示例：
+  hoc bill split bill-abc --into "实现API","编写测试","更新文档"`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		billID := args[0]
+		subTitles, _ := cmd.Flags().GetStringSlice("into")
+
+		b, err := db.GetBill(billID)
+		if err != nil {
+			return fmt.Errorf("bill not found: %s", billID)
+		}
+
+		if b.Status != "draft" && b.Status != "reading" {
+			return fmt.Errorf("议案状态为 [%s]，只有 draft/reading 状态的议案可拆分", b.Status)
+		}
+
+		if len(subTitles) < 2 {
+			return fmt.Errorf("至少需要拆分为 2 个子议案")
+		}
+
+		// Create sub-bills.
+		var subIDs []string
+		for _, title := range subTitles {
+			subID := shortID("bill")
+			sub := &store.Bill{
+				ID:         subID,
+				SessionID:  b.SessionID,
+				Title:      title,
+				Status:     "draft",
+				DependsOn:  store.NullString("[]"),
+				Portfolio:  b.Portfolio,
+				Project:    b.Project,
+				ParentBill: billID,
+			}
+			if err := db.CreateBill(sub); err != nil {
+				return fmt.Errorf("create sub-bill: %w", err)
+			}
+			subIDs = append(subIDs, subID)
+			fmt.Printf("   📄 子议案 [%s] %s\n", subID, title)
+		}
+
+		// Mark original as epic.
+		if err := db.UpdateBillStatus(billID, "epic"); err != nil {
+			return fmt.Errorf("update bill status: %w", err)
+		}
+
+		payload := fmt.Sprintf(`{"sub_bills":%d}`, len(subIDs))
+		_ = db.RecordEvent("bill.split", "cli", billID, "", b.SessionID.String, payload)
+
+		fmt.Printf("\n✂  议案 [%s] \"%s\" 已拆分为 %d 个子议案（状态: epic）\n", billID, b.Title, len(subIDs))
+		return nil
+	},
+}
+

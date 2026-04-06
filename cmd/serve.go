@@ -2,8 +2,12 @@ package cmd
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,7 +25,7 @@ var (
 	serveDir  string
 )
 
-// serveCmd represents the serve command
+// serveCmd represents the serve command.
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "启动 API Server",
@@ -90,6 +94,7 @@ API 端点：
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register flags in init().
 func init() {
 	serveCmd.Flags().StringVar(&servePort, "port", "8080", "API Server 监听端口")
 	serveCmd.Flags().StringVar(&serveDir, "dir", "", "工作目录（默认为 ~/.hoc）")
@@ -103,7 +108,7 @@ func registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	// API v1 routes.
@@ -251,11 +256,36 @@ func handleMinisterAction(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
 		if action == "summon" {
-			// TODO: Implement minister summon via API.
+			var req struct {
+				BillID string `json:"bill_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+
+			minister, err := db.GetMinister(ministerID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, "minister not found")
+				return
+			}
+
+			if minister.Status != "idle" && minister.Status != "offline" {
+				writeError(w, http.StatusConflict, fmt.Sprintf("minister status is %q, must be idle or offline", minister.Status))
+				return
+			}
+
+			if err := db.UpdateMinisterStatus(ministerID, "working"); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+
+			_ = db.RecordEvent("minister.summoned", "api", req.BillID, ministerID, "", "")
+
 			writeJSON(w, map[string]string{
-				"status":   "not implemented",
-				"minister": ministerID,
-				"message":  "minister summon via API not yet implemented",
+				"status":      "summoned",
+				"minister_id": ministerID,
+				"bill_id":     req.BillID,
 			})
 			return
 		}
@@ -306,6 +336,60 @@ func handleBillAction(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+
+		if action == "enacted" {
+			var req struct {
+				Quality  float64 `json:"quality"`
+				Notes    string  `json:"notes"`
+				Duration int     `json:"duration"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+
+			b, err := db.GetBill(billID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, "bill not found")
+				return
+			}
+
+			if err := db.UpdateBillStatus(billID, "enacted"); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+
+			ministerID := b.Assignee.String
+			if ministerID != "" {
+				h := &store.Hansard{
+					ID:         shortID("hansard"),
+					MinisterID: ministerID,
+					BillID:     billID,
+					Outcome:    store.NullString("enacted"),
+					DurationS:  req.Duration,
+					Quality:    req.Quality,
+					Notes:      store.NullString(req.Notes),
+				}
+				_ = db.CreateHansard(h)
+			}
+
+			summary := fmt.Sprintf("议案 [%s] \"%s\" 已通过（Enacted）", billID, b.Title)
+			if req.Notes != "" {
+				summary += "。备注：" + req.Notes
+			}
+			g := &store.Gazette{
+				ID:           shortID("gazette"),
+				FromMinister: store.NullString(ministerID),
+				BillID:       store.NullString(billID),
+				Type:         store.NullString("completion"),
+				Summary:      summary,
+			}
+			_ = db.CreateGazette(g)
+
+			writeJSON(w, map[string]string{
+				"status":  "enacted",
+				"bill_id": billID,
+			})
+			return
+		}
+
 		writeError(w, http.StatusBadRequest, "unknown action")
 
 	default:
@@ -340,23 +424,103 @@ func handleGazettes(w http.ResponseWriter, r *http.Request) {
 func handleWebhooks(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
-		// Generic webhook handler for GitHub Actions, etc.
+		// Read body for HMAC verification.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read body")
+			return
+		}
+
+		// HMAC-SHA256 verification if secret is configured.
+		secret := os.Getenv("HOC_WEBHOOK_SECRET")
+		if secret != "" {
+			sig := r.Header.Get("X-Hub-Signature-256")
+			if sig == "" {
+				writeError(w, http.StatusUnauthorized, "missing X-Hub-Signature-256")
+				return
+			}
+			if !verifyWebhookSignature(body, sig, secret) {
+				writeError(w, http.StatusUnauthorized, "invalid signature")
+				return
+			}
+		}
+
 		var payload map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.Unmarshal(body, &payload); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
-		// TODO: Process webhook events (push, PR, etc.)
-		// For now, just acknowledge receipt.
-		writeJSON(w, map[string]string{
-			"status":  "received",
-			"message": "webhook received",
-		})
+		_ = db.RecordEvent("webhook.received", "api", "", "", "", "")
+
+		eventType := r.Header.Get("X-GitHub-Event")
+		switch eventType {
+		case "push":
+			// Extract commit info and create a bill.
+			commits, _ := payload["commits"].([]interface{})
+			if len(commits) > 0 {
+				firstCommit, _ := commits[0].(map[string]interface{})
+				message, _ := firstCommit["message"].(string)
+				if message != "" {
+					billID := shortID("bill")
+					b := &store.Bill{
+						ID:        billID,
+						Title:     truncate(message, 100),
+						Status:    "draft",
+						DependsOn: store.NullString("[]"),
+					}
+					_ = db.CreateBill(b)
+					_ = db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"push"}`)
+				}
+			}
+
+			writeJSON(w, map[string]string{
+				"status": "processed",
+				"event":  "push",
+			})
+
+		case "pull_request":
+			pr, _ := payload["pull_request"].(map[string]interface{})
+			title, _ := pr["title"].(string)
+			if title == "" {
+				title = "PR Review"
+			}
+			billID := shortID("bill")
+			b := &store.Bill{
+				ID:          billID,
+				Title:       "Review: " + truncate(title, 90),
+				Description: store.NullString("PR review from webhook"),
+				Status:      "draft",
+				DependsOn:   store.NullString("[]"),
+			}
+			_ = db.CreateBill(b)
+			_ = db.RecordEvent("bill.created", "webhook", billID, "", "", `{"event":"pull_request"}`)
+
+			writeJSON(w, map[string]string{
+				"status":  "processed",
+				"event":   "pull_request",
+				"bill_id": billID,
+			})
+
+		default:
+			writeJSON(w, map[string]string{
+				"status":  "received",
+				"event":   eventType,
+				"message": "event type not handled, acknowledged",
+			})
+		}
 
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// verifyWebhookSignature checks HMAC-SHA256 signature for GitHub webhooks.
+func verifyWebhookSignature(body []byte, signature, secret string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

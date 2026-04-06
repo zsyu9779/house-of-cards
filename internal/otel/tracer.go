@@ -158,7 +158,7 @@ type Provider struct {
 }
 
 // NewProvider creates a Provider for the given service and export mode.
-// exporterType: "stdout" | "otlp" | "nop"
+// exporterType: "stdout" | "otlp" | "nop".
 func NewProvider(serviceName, exporterType string) *Provider {
 	var exp Exporter
 	switch exporterType {

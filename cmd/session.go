@@ -49,22 +49,27 @@ type billSpec struct {
 	DependsOn []string `toml:"depends_on"`
 }
 
-// sessionCmd represents the session command
+// sessionCmd represents the session command.
 var sessionCmd = &cobra.Command{
 	Use:   "session",
 	Short: "管理 Session（会期）",
 	Long:  "会期管理命令：开启、状态、解散",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	sessionCmd.AddCommand(sessionOpenCmd)
 	sessionCmd.AddCommand(sessionStatusCmd)
 	sessionCmd.AddCommand(sessionDissolveCmd)
 	sessionCmd.AddCommand(sessionMigrateCmd) // Phase 3E
 	sessionCmd.AddCommand(sessionStatsCmd)   // Phase 5A
+	sessionCmd.AddCommand(sessionPauseCmd)   // Phase 3: D-3
+	sessionCmd.AddCommand(sessionResumeCmd)  // Phase 3: D-3
+	sessionCmd.AddCommand(sessionAdvanceCmd) // Phase 3: D-3
+	sessionCmd.AddCommand(sessionReplayCmd)  // Phase 4: C-3
 
 	sessionOpenCmd.Flags().String("project", "", "单个项目名称（已废弃，使用 --projects）")
 	sessionOpenCmd.Flags().String("projects", "", "项目列表，逗号分隔（用于多项目会期）")
@@ -75,6 +80,9 @@ func init() {
 	sessionMigrateCmd.Flags().Bool("confirm", false, "执行迁移（默认为预演模式）")
 
 	sessionStatsCmd.Flags().Bool("all", false, "显示所有会期的汇总统计")
+
+	sessionPauseCmd.Flags().String("reason", "", "暂停原因")
+	sessionAdvanceCmd.Flags().Bool("force", false, "强制推进（确认所有 draft bill 可调度）")
 }
 
 var sessionOpenCmd = &cobra.Command{
@@ -263,6 +271,8 @@ var sessionStatusCmd = &cobra.Command{
 				statusIcon = "✅"
 			} else if s.Status == "dissolved" {
 				statusIcon = "⚫"
+			} else if s.Status == "paused" {
+				statusIcon = "⏸"
 			}
 			projStr := ""
 			if s.Project.String != "" {
@@ -465,6 +475,8 @@ func billStatusIcon(status string) string {
 		return "👑"
 	case "failed":
 		return "❌"
+	case "epic":
+		return "📦"
 	default:
 		return "⚪"
 	}
@@ -589,6 +601,351 @@ func printSessionStats(stats *store.SessionStats) {
 			fmt.Printf("  %-22s %s  %d bill(s)  %d✅  质量%s\n",
 				truncate(ml.Title, 22), bar, ml.Bills, ml.Enacted, qualStr)
 		}
+	}
+}
+
+// ─── Phase 3: D-3 Session Governance Commands ────────────────────────────────
+
+var sessionPauseCmd = &cobra.Command{
+	Use:   "pause [session-id]",
+	Short: "暂停会期（active → paused）",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		sid := args[0]
+		reason, _ := cmd.Flags().GetString("reason")
+
+		s, err := db.GetSession(sid)
+		if err != nil {
+			return fmt.Errorf("session not found: %s", sid)
+		}
+
+		if s.Status != "active" {
+			return fmt.Errorf("会期状态为 [%s]，只有 active 状态的会期可暂停", s.Status)
+		}
+
+		if err := db.UpdateSessionStatus(sid, "paused"); err != nil {
+			return fmt.Errorf("update session status: %w", err)
+		}
+
+		payload := fmt.Sprintf(`{"reason":"%s"}`, reason)
+		_ = db.RecordEvent("governance.session_paused", "cli", "", "", sid, payload)
+
+		fmt.Printf("⏸  会期 [%s] \"%s\" 已暂停\n", sid, s.Title)
+		if reason != "" {
+			fmt.Printf("   原因: %s\n", reason)
+		}
+		fmt.Printf("   使用 `hoc session resume %s` 恢复。\n", sid)
+		return nil
+	},
+}
+
+var sessionResumeCmd = &cobra.Command{
+	Use:   "resume [session-id]",
+	Short: "恢复已暂停的会期（paused → active）",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		sid := args[0]
+		s, err := db.GetSession(sid)
+		if err != nil {
+			return fmt.Errorf("session not found: %s", sid)
+		}
+
+		if s.Status != "paused" {
+			return fmt.Errorf("会期状态为 [%s]，只有 paused 状态的会期可恢复", s.Status)
+		}
+
+		if err := db.UpdateSessionStatus(sid, "active"); err != nil {
+			return fmt.Errorf("update session status: %w", err)
+		}
+
+		_ = db.RecordEvent("governance.session_resumed", "cli", "", "", sid, "")
+
+		fmt.Printf("▶  会期 [%s] \"%s\" 已恢复（paused → active）\n", sid, s.Title)
+		return nil
+	},
+}
+
+var sessionAdvanceCmd = &cobra.Command{
+	Use:   "advance [session-id]",
+	Short: "强制推进会期（确认所有 draft bill 可调度）",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		sid := args[0]
+		force, _ := cmd.Flags().GetBool("force")
+
+		s, err := db.GetSession(sid)
+		if err != nil {
+			return fmt.Errorf("session not found: %s", sid)
+		}
+
+		if s.Status != "active" && s.Status != "paused" {
+			return fmt.Errorf("会期状态为 [%s]，不可推进", s.Status)
+		}
+
+		if !force {
+			return fmt.Errorf("请使用 --force 确认推进操作")
+		}
+
+		// Ensure session is active.
+		if s.Status == "paused" {
+			if err := db.UpdateSessionStatus(sid, "active"); err != nil {
+				return fmt.Errorf("update session status: %w", err)
+			}
+		}
+
+		_ = db.RecordEvent("governance.session_advanced", "cli", "", "", sid, "")
+
+		// List draft bills for visibility.
+		bills, err := db.ListBillsBySession(sid)
+		if err != nil {
+			return fmt.Errorf("list bills: %w", err)
+		}
+
+		draftCount := 0
+		for _, b := range bills {
+			if b.Status == "draft" {
+				draftCount++
+			}
+		}
+
+		fmt.Printf("⏩ 会期 [%s] \"%s\" 已强制推进\n", sid, s.Title)
+		fmt.Printf("   状态: %s → active  待调度 draft 议案: %d\n", s.Status, draftCount)
+		return nil
+	},
+}
+
+// ─── Phase 4: C-3 Session Replay ──────────────────────────────────────────────
+
+var sessionReplayCmd = &cobra.Command{
+	Use:   "replay [session-id]",
+	Short: "回放会期时间线（事件 + 议事录）",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := initDB(); err != nil {
+			return err
+		}
+		defer db.Close()
+
+		sid := args[0]
+		s, err := db.GetSession(sid)
+		if err != nil {
+			return fmt.Errorf("session not found: %s", sid)
+		}
+
+		events, err := db.ListEventsBySession(sid)
+		if err != nil {
+			return fmt.Errorf("list events: %w", err)
+		}
+
+		hansards, err := db.ListHansardBySession(sid)
+		if err != nil {
+			return fmt.Errorf("list hansard: %w", err)
+		}
+
+		timeline := buildReplayTimeline(events, hansards)
+
+		fmt.Printf("📽  会期回放 — \"%s\" [%s]\n", s.Title, s.ID)
+		fmt.Println("═══════════════════════════════════════════════")
+
+		if len(timeline) == 0 {
+			fmt.Println("  （无事件记录）")
+		}
+		for _, entry := range timeline {
+			fmt.Println(entry)
+		}
+
+		// Session stats summary.
+		bills, _ := db.ListBillsBySession(sid)
+		totalBills := len(bills)
+		enacted := 0
+		failed := 0
+		var totalQuality float64
+		qualityCount := 0
+		byElections := 0
+
+		for _, b := range bills {
+			switch b.Status {
+			case "enacted", "royal_assent":
+				enacted++
+			case "failed":
+				failed++
+			}
+		}
+		for _, h := range hansards {
+			if h.Quality > 0 {
+				totalQuality += h.Quality
+				qualityCount++
+			}
+		}
+		for _, e := range events {
+			if strings.HasPrefix(e.Topic, "by_election") {
+				byElections++
+			}
+		}
+
+		avgQ := 0.0
+		if qualityCount > 0 {
+			avgQ = totalQuality / float64(qualityCount)
+		}
+
+		fmt.Println()
+		fmt.Println("── 会期统计 ──")
+		fmt.Printf("  总议案: %d  通过: %d  失败: %d  平均质量: %.2f\n", totalBills, enacted, failed, avgQ)
+		fmt.Printf("  补选次数: %d\n", byElections)
+
+		// Per-minister performance.
+		type ministerPerf struct {
+			enacted int
+			total   int
+			totalQ  float64
+			qCount  int
+		}
+		perfMap := make(map[string]*ministerPerf)
+		for _, h := range hansards {
+			mp, ok := perfMap[h.MinisterID]
+			if !ok {
+				mp = &ministerPerf{}
+				perfMap[h.MinisterID] = mp
+			}
+			mp.total++
+			if h.Outcome.String == "enacted" {
+				mp.enacted++
+			}
+			if h.Quality > 0 {
+				mp.totalQ += h.Quality
+				mp.qCount++
+			}
+		}
+
+		if len(perfMap) > 0 {
+			fmt.Println()
+			fmt.Println("── 部长表现 ──")
+			for mid, mp := range perfMap {
+				avgMQ := 0.0
+				if mp.qCount > 0 {
+					avgMQ = mp.totalQ / float64(mp.qCount)
+				}
+				bar := buildQualityBar(avgMQ, 10)
+				fmt.Printf("  %-20s %s %.2f  %d/%d\n", truncate(mid, 20), bar, avgMQ, mp.enacted, mp.total)
+			}
+		}
+
+		return nil
+	},
+}
+
+// timelineEntry represents a single entry in the replay timeline.
+type timelineEntry struct {
+	ts   time.Time
+	line string
+}
+
+// buildReplayTimeline merges events and hansard records into a chronological timeline.
+func buildReplayTimeline(events []*store.Event, hansards []*store.Hansard) []string {
+	var entries []timelineEntry
+
+	for _, e := range events {
+		icon := topicIcon(e.Topic)
+		detail := e.BillID.String
+		if e.MinisterID.String != "" {
+			if detail != "" {
+				detail += " → " + e.MinisterID.String
+			} else {
+				detail = e.MinisterID.String
+			}
+		}
+		line := fmt.Sprintf("[%s] %s %-22s %s",
+			e.Timestamp.Format("2006-01-02 15:04:05"),
+			icon,
+			e.Topic,
+			detail,
+		)
+		entries = append(entries, timelineEntry{ts: e.Timestamp, line: line})
+	}
+
+	for _, h := range hansards {
+		icon := "📜"
+		if h.Outcome.String == "enacted" {
+			icon = "✅"
+		} else if h.Outcome.String == "failed" {
+			icon = "❌"
+		}
+		qualStr := ""
+		if h.Quality > 0 {
+			qualStr = fmt.Sprintf("  质量: %.2f", h.Quality)
+		}
+		durStr := ""
+		if h.DurationS > 0 {
+			durStr = fmt.Sprintf("  耗时: %s", formatDuration(h.DurationS))
+		}
+		line := fmt.Sprintf("[%s] %s hansard.%s         %s → %s%s%s",
+			h.CreatedAt.Format("2006-01-02 15:04:05"),
+			icon,
+			h.Outcome.String,
+			h.MinisterID,
+			h.BillID,
+			qualStr,
+			durStr,
+		)
+		entries = append(entries, timelineEntry{ts: h.CreatedAt, line: line})
+	}
+
+	// Sort by timestamp.
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].ts.Before(entries[i].ts) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+
+	lines := make([]string, len(entries))
+	for i, e := range entries {
+		lines[i] = e.line
+	}
+	return lines
+}
+
+// topicIcon maps event topics to display icons.
+func topicIcon(topic string) string {
+	switch {
+	case topic == "bill.created":
+		return "📄"
+	case topic == "bill.assigned":
+		return "🔄"
+	case topic == "bill.enacted":
+		return "✅"
+	case topic == "minister.stuck":
+		return "🔴"
+	case strings.HasPrefix(topic, "by_election"):
+		return "🗳"
+	case strings.HasPrefix(topic, "gazette"):
+		return "📨"
+	case topic == "session.completed":
+		return "🏁"
+	case strings.HasPrefix(topic, "privy"):
+		return "⚖️"
+	case strings.HasPrefix(topic, "committee"):
+		return "🔍"
+	case strings.HasPrefix(topic, "governance"):
+		return "🏛"
+	default:
+		return "📌"
 	}
 }
 

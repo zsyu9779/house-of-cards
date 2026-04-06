@@ -167,8 +167,7 @@ type MetricExporter interface {
 
 // StdoutMetricExporter writes MetricPoints as JSON lines to stdout.
 type StdoutMetricExporter struct {
-	mu sync.Mutex
-	e  *StdoutExporter // reuse the same writer
+	e *StdoutExporter // reuse the same writer
 }
 
 // NewStdoutMetricExporter creates a metric exporter that shares the span writer.

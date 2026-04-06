@@ -16,16 +16,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// whipCmd represents the whip command
+// whipCmd represents the whip command.
 var whipCmd = &cobra.Command{
 	Use:   "whip",
 	Short: "Whip（党鞭）管理",
 	Long:  "党鞭管理命令：启动守护进程、查看报告、停止",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	whipCmd.AddCommand(whipStartCmd)
 	whipCmd.AddCommand(whipStopCmd)
@@ -75,7 +76,7 @@ var whipStartCmd = &cobra.Command{
 			cancel()
 		}()
 
-		w := whip.New(db, hocDir)
+		w := whip.New(db, hocDir, cfg)
 		w.Run(ctx)
 		return nil
 	},

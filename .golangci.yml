@@ -1,0 +1,61 @@
+# golangci-lint configuration — v0.3 quality gate
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    # --- v0.2 baseline ---
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    # --- v0.3 new ---
+    - gosec          # security scanning
+    - gocritic       # code quality
+    - exhaustive     # switch enum completeness
+    - gochecknoinits # forbid init() functions
+    - godot          # comment style
+
+linters-settings:
+  errcheck:
+    # Allow ignoring errors from these functions (common in CLI code).
+    exclude-functions:
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - fmt.Printf
+      - fmt.Println
+
+  gosec:
+    excludes:
+      # G104: unhandled errors — deferred to E-1 error governance.
+      # Remove this exclusion after E-1 is complete.
+      - G104
+    severity: high
+    confidence: medium
+
+  gocritic:
+    enabled-checks:
+      - badLock
+      - nilValReturn
+
+  exhaustive:
+    default-signifies-exhaustive: true
+
+  godot:
+    scope: declarations
+    period: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Test files can use init().
+    - path: _test\.go
+      linters:
+        - gochecknoinits
+    # Test files don't need exhaustive switch.
+    - path: _test\.go
+      linters:
+        - exhaustive

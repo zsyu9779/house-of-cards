@@ -4,64 +4,50 @@
 
 ## 项目状态
 
-- **阶段**: v0.2 Phase 1 全部完成 + 巡检修复完成（2026-03-08），待开始 Phase 2
-- **目标**: 下一步 Phase 2 — A-1 CLAUDE.md + B-1 Gazette+ACK 协议
+- **阶段**: v0.3 Phase 1 实施中
+- **版本定位**: 质量强化版——不加新功能，专注错误处理、测试、日志、Lint
+- **当前进度**: PR-2 (E-1.1 Whip 错误治理) ✅ 完成
 
-## 最近工作
+## 最近工作（2026-04-06）
 
-### Phase 1 巡检修复（2026-03-08）
+### PR-2: E-1.1 Whip 错误治理 + 恢复梯度 ✅
 
-对照 `docs/v0.2-feature-spec.md` + `docs/v0.2/` 草案巡检，发现并修复 3 个问题：
+**Store 层**:
+- Minister struct 新增 `RecoveryAttempts int` 字段
+- migrate() 新增 `ALTER TABLE ministers ADD COLUMN recovery_attempts INTEGER DEFAULT 0`
+- 所有 7 个 minister SELECT/Scan 更新为包含 `COALESCE(recovery_attempts,0)`
+- 新增 `IncrementRecoveryAttempts()` 和 `ResetRecoveryAttempts()` 方法
 
-| # | 问题 | 修复 |
-|---|------|------|
-| 1 (Critical) | RecordEvent 全项目零调用 | 在 6 个文件追加 19 处调用，覆盖 Spec 列出的全部 16 个 topic |
-| 2 (Medium) | session open 缺 `--force` | 添加 `--force` flag + 校验跳过逻辑 |
-| 3 (Low) | serve.go 未集成校验 | 确认当前无 bill 创建 API，属"未来端点"，暂不改 |
+**liveness.go**:
+- Pass 1: 心跳更新错误处理 + 恢复重置逻辑（RecoveryAttempts > 0 时 reset）
+- Pass 2: 完整替换为三级恢复梯度（checkpoint → at-risk → by-election）
+- byElection: RecordEvent 改为 slog.Warn
 
-RecordEvent 调用分布：
-- `liveness.go`(3): minister.stuck, by_election.triggered/completed
-- `scheduler.go`(7): bill.assigned, session.completed(x2), privy.merge_success/conflict, autoscale.triggered(x2)
-- `poller.go`(3): bill.enacted, committee.assigned/result
-- `dispatch.go`(2): gazette.delivered (tmux + inbox)
-- `cmd/bill.go`(1): bill.created
-- `cmd/session.go`(1): bill.created
+**poller.go** (全部修复):
+- pollDoneFiles: RecordEvent → slog.Warn, UpdateMinisterStatus → critical, os.Remove → best-effort
+- committeeAutomation: RecordEvent → slog.Warn
+- pollReviewFile: UpdateBillStatus × 2 → critical+return, UnassignBill → critical, UpdateMinisterStatus → critical, os.Remove → best-effort, RecordEvent/CreateHansard/CreateGazette → slog.Warn
+- pollAckFiles: UpdateMinisterStatus → critical+continue, os.Remove → best-effort
+- collectQuestionMetrics: UpdateHansardMetrics → slog.Warn
 
-### v0.2 Phase 1 全部完成（2026-03-08）
+**scheduler.go** (全部修复):
+- privyAutoMerge: UpdateSessionStatus × 4 → critical+return, RecordEvent × 4 → slog.Warn, CreateGazette 已有错误处理
+- autoAssign: RecordEvent → slog.Warn
+- autoscale: UpdateMinisterStatus × 2 → critical (成功后才发 Gazette/RecordEvent), RecordEvent × 2 → slog.Warn, CreateGazette × 2 → slog.Warn
 
-| Feature | 编号 | 状态 |
-|---------|------|------|
-| 统一事件表 | D-1 | ✅ 完成（含 19 处 RecordEvent 埋点） |
-| Bill 入口校验 | D-2 | ✅ 完成（bill draft + session open 均支持 --force） |
-| GitHub Actions CI | E-1 | ✅ 完成 |
-| Whip 子模块拆分 | C-1 | ✅ 完成（6 文件） |
+**dispatch.go**:
+- os.WriteFile → best-effort 注释, RecordEvent → slog.Warn
 
-### 更早的工作（已归档）
+**验证**: `golangci-lint run` 零 error + `go build` + `go vet` + `go test -race` 全部通过
+- `grep '_ = w.db.' internal/whip/` = 0 匹配（关键路径零 _ =）
+- `grep '_ = os.' internal/whip/` = 4 匹配，全部有 `// best-effort:` 注释
 
-- v0.2 Feature 规格文档整合定稿
-- 巡检修复 6 任务全部 PASS，覆盖率 31.6% -> 40.3%
-- v0.2 总体草案、v0.1 文档归档
+## 下一步
 
-## v0.2 实施路线进度
-
-| Phase | 内容 | 状态 |
-|-------|------|------|
-| **Phase 1** | D-1 事件表 + D-2 入口校验 + E-1 CI + C-1 Whip 拆分 | **✅ 完成** |
-| Phase 2 | A-1 CLAUDE.md + B-1 Gazette+ACK + C-1 测试补强 | 待开始 |
-| Phase 3 | A-2 Autoscale + A-3 API + B-2/B-3 + D-3 治理 + E-2 | 待开始 |
-| Phase 4 | C-2 Doctor + C-3 回放 + E-3/E-4 + 质询度量 | 待开始 |
-
-## 待解决问题
-
-| 问题 | 说明 | 优先级 |
-|------|------|--------|
-| serve.go bill 创建 API 校验 | 当前无 bill 创建端点，A-3 实施时集成 | P1 |
-| whip tick/threeLineWhip 测试 | 依赖真实 tmux/PID | P2 |
-| privy AnalyzeBranch 测试 | 需更复杂 git 分叉场景 | P2 |
-
-## 下一步候选
-
-1. **开始 Phase 2**：A-1 Minister CLAUDE.md 写入 + B-1 Gazette 结构化 + ACK 协议
-2. B-1 分 3 步：Step 1 结构化 payload → Step 2 ACK 基础设施 → Step 3 Question Time
+继续 Phase 1：
+1. ~~**PR-1**: C-1 Linter 升级~~ ✅
+2. ~~**PR-2**: E-1.1 Whip 错误治理~~ ✅
+3. **PR-3**: E-1.2 Serve 错误治理
+4. **PR-4**: E-2 配置校验
 
 ---

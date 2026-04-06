@@ -1,4 +1,4 @@
-// Package store provides SQLite storage layer for House of Cards
+// Package store provides SQLite storage layer for House of Cards.
 package store
 
 import (
@@ -90,7 +90,11 @@ func (db *DB) migrate() error {
 		summary TEXT NOT NULL,
 		artifacts TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		read_at DATETIME
+		read_at DATETIME,
+		ack_status TEXT DEFAULT '',
+		thread_id TEXT DEFAULT '',
+		reply_to TEXT DEFAULT '',
+		payload TEXT DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS hansard (
@@ -116,6 +120,20 @@ func (db *DB) migrate() error {
 	_, _ = db.conn.Exec(`ALTER TABLE sessions ADD COLUMN projects TEXT DEFAULT '[]'`)
 	// Phase 3B: Minister hook queue (JSON array of bill IDs).
 	_, _ = db.conn.Exec(`ALTER TABLE ministers ADD COLUMN hook TEXT DEFAULT '[]'`)
+	// Phase 2: Gazette ACK protocol + structured payload.
+	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN ack_status TEXT DEFAULT ''`)
+	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN thread_id TEXT DEFAULT ''`)
+	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN reply_to TEXT DEFAULT ''`)
+	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN payload TEXT DEFAULT ''`)
+	// Phase 2: Session ACK mode.
+	_, _ = db.conn.Exec(`ALTER TABLE sessions ADD COLUMN ack_mode TEXT DEFAULT 'auto'`)
+	// Phase 3: B-3 Bill split — parent bill reference.
+	_, _ = db.conn.Exec(`ALTER TABLE bills ADD COLUMN parent_bill TEXT DEFAULT ''`)
+	// Phase 4: B-1.4 Question Time metrics on hansard.
+	_, _ = db.conn.Exec(`ALTER TABLE hansard ADD COLUMN ack_rounds INTEGER DEFAULT 0`)
+	_, _ = db.conn.Exec(`ALTER TABLE hansard ADD COLUMN briefing_time_s INTEGER DEFAULT 0`)
+	// v0.3: Whip graduated recovery.
+	_, _ = db.conn.Exec(`ALTER TABLE ministers ADD COLUMN recovery_attempts INTEGER DEFAULT 0`)
 
 	// Indexes for common query patterns.
 	indexes := []string{
@@ -161,18 +179,19 @@ func NullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: s != ""}
 }
 
-// Minister CRUD
+// Minister CRUD.
 type Minister struct {
-	ID        string
-	Title     string
-	Runtime   string
-	Skills    string
-	Status    string
-	Pid       int
-	Worktree  sql.NullString
-	Heartbeat sql.NullTime
-	Hook      string // Phase 3B: JSON array of queued bill IDs
-	CreatedAt time.Time
+	ID               string
+	Title            string
+	Runtime          string
+	Skills           string
+	Status           string
+	Pid              int
+	Worktree         sql.NullString
+	Heartbeat        sql.NullTime
+	Hook             string // Phase 3B: JSON array of queued bill IDs
+	RecoveryAttempts int    // v0.3: graduated recovery attempt counter
+	CreatedAt        time.Time
 }
 
 func (db *DB) CreateMinister(m *Minister) error {
@@ -186,9 +205,9 @@ func (db *DB) CreateMinister(m *Minister) error {
 func (db *DB) GetMinister(id string) (*Minister, error) {
 	var m Minister
 	err := db.conn.QueryRow(
-		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), created_at
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
 		 FROM ministers WHERE id = ?`, id,
-	).Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.CreatedAt)
+	).Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +215,7 @@ func (db *DB) GetMinister(id string) (*Minister, error) {
 }
 
 func (db *DB) ListMinisters() ([]*Minister, error) {
-	rows, err := db.conn.Query(`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), created_at FROM ministers`)
+	rows, err := db.conn.Query(`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at FROM ministers`)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +224,29 @@ func (db *DB) ListMinisters() ([]*Minister, error) {
 	var ministers []*Minister
 	for rows.Next() {
 		var m Minister
-		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		ministers = append(ministers, &m)
+	}
+	return ministers, nil
+}
+
+// ListMinistersWithWorktree returns ministers that have a non-empty worktree path.
+func (db *DB) ListMinistersWithWorktree() ([]*Minister, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
+		 FROM ministers WHERE worktree IS NOT NULL AND worktree != ''`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ministers []*Minister
+	for rows.Next() {
+		var m Minister
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		ministers = append(ministers, &m)
@@ -228,7 +269,31 @@ func (db *DB) DeleteMinister(id string) error {
 	return err
 }
 
-// Session CRUD
+// IncrementRecoveryAttempts increments the recovery attempt counter and returns the new value.
+func (db *DB) IncrementRecoveryAttempts(ministerID string) (int, error) {
+	_, err := db.conn.Exec(
+		`UPDATE ministers SET recovery_attempts = recovery_attempts + 1 WHERE id = ?`,
+		ministerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	err = db.conn.QueryRow(
+		`SELECT recovery_attempts FROM ministers WHERE id = ?`, ministerID,
+	).Scan(&count)
+	return count, err
+}
+
+// ResetRecoveryAttempts resets the recovery counter (called on by-election or recovery).
+func (db *DB) ResetRecoveryAttempts(ministerID string) error {
+	_, err := db.conn.Exec(
+		`UPDATE ministers SET recovery_attempts = 0 WHERE id = ?`, ministerID,
+	)
+	return err
+}
+
+// Session CRUD.
 type Session struct {
 	ID        string
 	Title     string
@@ -236,8 +301,22 @@ type Session struct {
 	Config    sql.NullString
 	Project   sql.NullString // Deprecated: use Projects (JSON array)
 	Projects  sql.NullString // JSON array of project paths
+	AckMode   sql.NullString // "blocking" | "non-blocking" | "auto"
 	Status    string
 	CreatedAt time.Time
+}
+
+// EffectiveAckMode returns the resolved ACK mode for the session.
+// "auto" resolves to "blocking" for pipeline topology, "non-blocking" otherwise.
+func (s *Session) EffectiveAckMode() string {
+	mode := s.AckMode.String
+	if mode == "" || mode == AckModeAuto {
+		if s.Topology == "pipeline" {
+			return AckModeBlocking
+		}
+		return AckModeNonBlocking
+	}
+	return mode
 }
 
 // GetProjectsSlice returns the session's projects as a string slice.
@@ -277,8 +356,8 @@ func (db *DB) CreateSession(s *Session) error {
 func (db *DB) GetSession(id string) (*Session, error) {
 	var s Session
 	err := db.conn.QueryRow(
-		`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), COALESCE(projects,'[]'), status, created_at FROM sessions WHERE id = ?`, id,
-	).Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Projects, &s.Status, &s.CreatedAt)
+		`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), COALESCE(projects,'[]'), COALESCE(ack_mode,'auto'), status, created_at FROM sessions WHERE id = ?`, id,
+	).Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Projects, &s.AckMode, &s.Status, &s.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +365,7 @@ func (db *DB) GetSession(id string) (*Session, error) {
 }
 
 func (db *DB) ListSessions() ([]*Session, error) {
-	rows, err := db.conn.Query(`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), COALESCE(projects,'[]'), status, created_at FROM sessions`)
+	rows, err := db.conn.Query(`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), COALESCE(projects,'[]'), COALESCE(ack_mode,'auto'), status, created_at FROM sessions`)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +374,7 @@ func (db *DB) ListSessions() ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Projects, &s.Status, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Projects, &s.AckMode, &s.Status, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, &s)
@@ -303,7 +382,7 @@ func (db *DB) ListSessions() ([]*Session, error) {
 	return sessions, nil
 }
 
-// Bill CRUD
+// Bill CRUD.
 type Bill struct {
 	ID          string
 	SessionID   sql.NullString
@@ -315,6 +394,7 @@ type Bill struct {
 	Branch      sql.NullString
 	Portfolio   sql.NullString
 	Project     sql.NullString // Optional: specific project for this bill
+	ParentBill  string         // Phase 3: B-3 parent bill ID for split bills
 	CreatedAt   time.Time
 	UpdatedAt   sql.NullTime
 }
@@ -325,9 +405,9 @@ func (db *DB) CreateBill(b *Bill) error {
 		project = sql.NullString{String: "", Valid: false}
 	}
 	_, err := db.conn.Exec(
-		`INSERT INTO bills (id, session_id, title, description, status, assignee, depends_on, branch, portfolio, project)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		b.ID, b.SessionID, b.Title, b.Description, b.Status, b.Assignee, b.DependsOn, b.Branch, b.Portfolio, project,
+		`INSERT INTO bills (id, session_id, title, description, status, assignee, depends_on, branch, portfolio, project, parent_bill)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		b.ID, b.SessionID, b.Title, b.Description, b.Status, b.Assignee, b.DependsOn, b.Branch, b.Portfolio, project, b.ParentBill,
 	)
 	return err
 }
@@ -335,17 +415,21 @@ func (db *DB) CreateBill(b *Bill) error {
 func (db *DB) GetBill(id string) (*Bill, error) {
 	var b Bill
 	err := db.conn.QueryRow(
-		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
 		 FROM bills WHERE id = ?`, id,
-	).Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt)
+	).Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &b, nil
 }
 
-func (db *DB) ListBills() ([]*Bill, error) {
-	rows, err := db.conn.Query(`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at FROM bills`)
+// GetDownstreamBills returns bills that depend on the given bill (i.e., downstream bills).
+func (db *DB) GetDownstreamBills(billID string) ([]*Bill, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
+		 FROM bills WHERE depends_on LIKE ?`, "%"+billID+"%",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +438,25 @@ func (db *DB) ListBills() ([]*Bill, error) {
 	var bills []*Bill
 	for rows.Next() {
 		var b Bill
-		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		bills = append(bills, &b)
+	}
+	return bills, nil
+}
+
+func (db *DB) ListBills() ([]*Bill, error) {
+	rows, err := db.conn.Query(`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at FROM bills`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bills []*Bill
+	for rows.Next() {
+		var b Bill
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		bills = append(bills, &b)
@@ -389,7 +491,7 @@ func (db *DB) UpdateSessionProjects(sessionID, projectsJSON string) error {
 	return err
 }
 
-// Gazette CRUD
+// Gazette CRUD.
 type Gazette struct {
 	ID           string
 	FromMinister sql.NullString
@@ -400,20 +502,24 @@ type Gazette struct {
 	Artifacts    sql.NullString
 	CreatedAt    time.Time
 	ReadAt       sql.NullTime
+	AckStatus    string // '' | 'delivered' | 'ack' | 'questioned' | 'escalated'
+	ThreadID     string // 质询线程 ID
+	ReplyTo      string // 回复的 Gazette ID
+	Payload      string // JSON: {summary, contracts, artifacts, assumptions}
 }
 
 func (db *DB) CreateGazette(g *Gazette) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO gazettes (id, from_minister, to_minister, bill_id, type, summary, artifacts) 
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		g.ID, g.FromMinister, g.ToMinister, g.BillID, g.Type, g.Summary, g.Artifacts,
+		`INSERT INTO gazettes (id, from_minister, to_minister, bill_id, type, summary, artifacts, ack_status, thread_id, reply_to, payload)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		g.ID, g.FromMinister, g.ToMinister, g.BillID, g.Type, g.Summary, g.Artifacts, g.AckStatus, g.ThreadID, g.ReplyTo, g.Payload,
 	)
 	return err
 }
 
 func (db *DB) ListGazettesForMinister(ministerID string) ([]*Gazette, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(from_minister,''), COALESCE(to_minister,''), COALESCE(bill_id,''), COALESCE(type,''), summary, COALESCE(artifacts,''), created_at, read_at 
+		`SELECT id, COALESCE(from_minister,''), COALESCE(to_minister,''), COALESCE(bill_id,''), COALESCE(type,''), summary, COALESCE(artifacts,''), created_at, read_at, COALESCE(ack_status,''), COALESCE(thread_id,''), COALESCE(reply_to,''), COALESCE(payload,'')
 		 FROM gazettes WHERE to_minister = ? OR to_minister IS NULL ORDER BY created_at DESC`, ministerID,
 	)
 	if err != nil {
@@ -424,7 +530,7 @@ func (db *DB) ListGazettesForMinister(ministerID string) ([]*Gazette, error) {
 	var gazettes []*Gazette
 	for rows.Next() {
 		var g Gazette
-		if err := rows.Scan(&g.ID, &g.FromMinister, &g.ToMinister, &g.BillID, &g.Type, &g.Summary, &g.Artifacts, &g.CreatedAt, &g.ReadAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.FromMinister, &g.ToMinister, &g.BillID, &g.Type, &g.Summary, &g.Artifacts, &g.CreatedAt, &g.ReadAt, &g.AckStatus, &g.ThreadID, &g.ReplyTo, &g.Payload); err != nil {
 			return nil, err
 		}
 		gazettes = append(gazettes, &g)
@@ -432,17 +538,19 @@ func (db *DB) ListGazettesForMinister(ministerID string) ([]*Gazette, error) {
 	return gazettes, nil
 }
 
-// Hansard CRUD
+// Hansard CRUD.
 type Hansard struct {
-	ID         string
-	MinisterID string
-	BillID     string
-	Outcome    sql.NullString
-	DurationS  int
-	SkillsUsed sql.NullString
-	Quality    float64
-	Notes      sql.NullString
-	CreatedAt  time.Time
+	ID            string
+	MinisterID    string
+	BillID        string
+	Outcome       sql.NullString
+	DurationS     int
+	SkillsUsed    sql.NullString
+	Quality       float64
+	Notes         sql.NullString
+	AckRounds     int
+	BriefingTimeS int
+	CreatedAt     time.Time
 }
 
 func (db *DB) CreateHansard(h *Hansard) error {
@@ -466,7 +574,7 @@ func (db *DB) UpdateMinisterPID(id string, pid int) error {
 
 func (db *DB) ListBillsBySession(sessionID string) ([]*Bill, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
 		 FROM bills WHERE session_id = ?`, sessionID,
 	)
 	if err != nil {
@@ -477,7 +585,7 @@ func (db *DB) ListBillsBySession(sessionID string) ([]*Bill, error) {
 	var bills []*Bill
 	for rows.Next() {
 		var b Bill
-		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		bills = append(bills, &b)
@@ -508,7 +616,7 @@ func (db *DB) ListGazettes() ([]*Gazette, error) {
 
 func (db *DB) ListGazettesForBill(billID string) ([]*Gazette, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(from_minister,''), COALESCE(to_minister,''), COALESCE(bill_id,''), COALESCE(type,''), summary, COALESCE(artifacts,''), created_at, read_at
+		`SELECT id, COALESCE(from_minister,''), COALESCE(to_minister,''), COALESCE(bill_id,''), COALESCE(type,''), summary, COALESCE(artifacts,''), created_at, read_at, COALESCE(ack_status,''), COALESCE(thread_id,''), COALESCE(reply_to,''), COALESCE(payload,'')
 		 FROM gazettes WHERE bill_id = ? ORDER BY created_at DESC`, billID,
 	)
 	if err != nil {
@@ -519,7 +627,7 @@ func (db *DB) ListGazettesForBill(billID string) ([]*Gazette, error) {
 	var gazettes []*Gazette
 	for rows.Next() {
 		var g Gazette
-		if err := rows.Scan(&g.ID, &g.FromMinister, &g.ToMinister, &g.BillID, &g.Type, &g.Summary, &g.Artifacts, &g.CreatedAt, &g.ReadAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.FromMinister, &g.ToMinister, &g.BillID, &g.Type, &g.Summary, &g.Artifacts, &g.CreatedAt, &g.ReadAt, &g.AckStatus, &g.ThreadID, &g.ReplyTo, &g.Payload); err != nil {
 			return nil, err
 		}
 		gazettes = append(gazettes, &g)
@@ -540,7 +648,7 @@ func (db *DB) UpdateSessionProject(id, project string) error {
 // ListBillsWithBranchBySession returns enacted bills with a non-empty branch for a session.
 func (db *DB) ListBillsWithBranchBySession(sessionID string) ([]*Bill, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
 		 FROM bills WHERE session_id = ? AND (status = 'enacted' OR status = 'royal_assent') AND branch IS NOT NULL AND branch != ''`, sessionID,
 	)
 	if err != nil {
@@ -551,7 +659,7 @@ func (db *DB) ListBillsWithBranchBySession(sessionID string) ([]*Bill, error) {
 	var bills []*Bill
 	for rows.Next() {
 		var b Bill
-		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		bills = append(bills, &b)
@@ -606,7 +714,7 @@ func (db *DB) ListHansardByMinister(ministerID string) ([]*Hansard, error) {
 // GetBillsByAssignee returns all bills currently assigned to the given minister.
 func (db *DB) GetBillsByAssignee(ministerID string) ([]*Bill, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
 		 FROM bills WHERE assignee = ?`, ministerID,
 	)
 	if err != nil {
@@ -617,7 +725,7 @@ func (db *DB) GetBillsByAssignee(ministerID string) ([]*Bill, error) {
 	var bills []*Bill
 	for rows.Next() {
 		var b Bill
-		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		bills = append(bills, &b)
@@ -660,7 +768,7 @@ func (db *DB) HansardSuccessRate(ministerID string) (enacted, total int, err err
 // ListMinistersWithStatus returns all ministers with the given status.
 func (db *DB) ListMinistersWithStatus(status string) ([]*Minister, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), created_at
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
 		 FROM ministers WHERE status = ?`, status,
 	)
 	if err != nil {
@@ -671,7 +779,7 @@ func (db *DB) ListMinistersWithStatus(status string) ([]*Minister, error) {
 	var ministers []*Minister
 	for rows.Next() {
 		var m Minister
-		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		ministers = append(ministers, &m)
@@ -682,7 +790,7 @@ func (db *DB) ListMinistersWithStatus(status string) ([]*Minister, error) {
 // ListWorkingMinisters returns all ministers currently in "working" status.
 func (db *DB) ListWorkingMinisters() ([]*Minister, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), created_at
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
 		 FROM ministers WHERE status = 'working'`,
 	)
 	if err != nil {
@@ -693,7 +801,30 @@ func (db *DB) ListWorkingMinisters() ([]*Minister, error) {
 	var ministers []*Minister
 	for rows.Next() {
 		var m Minister
-		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		ministers = append(ministers, &m)
+	}
+	return ministers, nil
+}
+
+// ListOfflineMinisters returns all ministers with status "offline" and non-empty skills.
+// These are candidates for the autoscale reserve pool.
+func (db *DB) ListOfflineMinisters() ([]*Minister, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
+		 FROM ministers WHERE status = 'offline' AND skills != '' AND skills != '[]'`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ministers []*Minister
+	for rows.Next() {
+		var m Minister
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		ministers = append(ministers, &m)
@@ -705,7 +836,7 @@ func (db *DB) ListWorkingMinisters() ([]*Minister, error) {
 // An empty skill matches all idle ministers.
 func (db *DB) ListIdleMinistersForSkill(skill string) ([]*Minister, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), created_at
+		`SELECT id, title, runtime, skills, status, COALESCE(pid,0), COALESCE(worktree,''), heartbeat, COALESCE(hook,'[]'), COALESCE(recovery_attempts,0), created_at
 		 FROM ministers WHERE status = 'idle'`,
 	)
 	if err != nil {
@@ -716,7 +847,7 @@ func (db *DB) ListIdleMinistersForSkill(skill string) ([]*Minister, error) {
 	var ministers []*Minister
 	for rows.Next() {
 		var m Minister
-		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Title, &m.Runtime, &m.Skills, &m.Status, &m.Pid, &m.Worktree, &m.Heartbeat, &m.Hook, &m.RecoveryAttempts, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		if skill == "" || ministerHasSkill(m.Skills, skill) {
@@ -738,7 +869,7 @@ func ministerHasSkill(skillsJSON, skill string) bool {
 // ListActiveSessions returns all sessions with status "active".
 func (db *DB) ListActiveSessions() ([]*Session, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), status, created_at
+		`SELECT id, title, topology, COALESCE(config,''), COALESCE(project,''), COALESCE(projects,'[]'), COALESCE(ack_mode,'auto'), status, created_at
 		 FROM sessions WHERE status = 'active'`,
 	)
 	if err != nil {
@@ -749,7 +880,7 @@ func (db *DB) ListActiveSessions() ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Status, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.Topology, &s.Config, &s.Project, &s.Projects, &s.AckMode, &s.Status, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, &s)
@@ -844,7 +975,7 @@ func (db *DB) ListRecentHansard(limit int) ([]*Hansard, error) {
 // It updates bill status to "enacted", records a Hansard entry (outcome: enacted),
 // computes a quality score, and creates a completion Gazette.
 // Called by the Whip pollDoneFiles loop.
-func (db *DB) EnactBillFromDone(billID, ministerID, summary string) error {
+func (db *DB) EnactBillFromDone(billID, ministerID, summary, payloadJSON string) error {
 	if err := db.UpdateBillStatus(billID, "enacted"); err != nil {
 		return fmt.Errorf("update bill status: %w", err)
 	}
@@ -868,16 +999,39 @@ func (db *DB) EnactBillFromDone(billID, ministerID, summary string) error {
 		ID:           fmt.Sprintf("gazette-%x", time.Now().UnixNano()),
 		FromMinister: NullString(ministerID),
 		BillID:       NullString(billID),
-		Type:         NullString("completion"),
+		Type:         NullString(GazetteCompletion),
 		Summary:      fmt.Sprintf("完成公报：议案 [%s] 已由部长 [%s] 完成并 enacted。\n\n%s", billID, ministerID, summary),
+		Payload:      payloadJSON,
 	}
 	return db.CreateGazette(g)
+}
+
+// ListSubBills returns all bills whose parent_bill matches the given ID.
+func (db *DB) ListSubBills(parentID string) ([]*Bill, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
+		 FROM bills WHERE parent_bill = ?`, parentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bills []*Bill
+	for rows.Next() {
+		var b Bill
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		bills = append(bills, &b)
+	}
+	return bills, nil
 }
 
 // ListBillsForCommittee returns all bills currently in committee review stage.
 func (db *DB) ListBillsForCommittee() ([]*Bill, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), created_at, updated_at
+		`SELECT id, COALESCE(session_id,''), title, COALESCE(description,''), status, COALESCE(assignee,''), COALESCE(depends_on,''), COALESCE(branch,''), COALESCE(portfolio,''), COALESCE(project,''), COALESCE(parent_bill,''), created_at, updated_at
 		 FROM bills WHERE status = 'committee'`,
 	)
 	if err != nil {
@@ -888,7 +1042,7 @@ func (db *DB) ListBillsForCommittee() ([]*Bill, error) {
 	var bills []*Bill
 	for rows.Next() {
 		var b Bill
-		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.Title, &b.Description, &b.Status, &b.Assignee, &b.DependsOn, &b.Branch, &b.Portfolio, &b.Project, &b.ParentBill, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		bills = append(bills, &b)
@@ -1017,7 +1171,7 @@ func (db *DB) PeekHook(ministerID string) ([]string, error) {
 }
 
 // FindLeastLoadedMinister returns the idle minister with the fewest assigned bills
-// that matches the given portfolio skill. Phase 3E — 负载均衡分配
+// that matches the given portfolio skill. Phase 3E — 负载均衡分配.
 func (db *DB) FindLeastLoadedMinister(skill string) (*Minister, error) {
 	candidates, err := db.ListIdleMinistersForSkill(skill)
 	if err != nil || len(candidates) == 0 {
@@ -1155,8 +1309,10 @@ func (db *DB) FindBestMinisterForSkill(skill string) (*Minister, error) {
 				load++
 			}
 		}
-		// Score = quality × (1 / (load + 1))  — higher is better.
-		score := quality / float64(load+1)
+		// Score = quality × (1 + firstACKRate × 0.2) / (load + 1).
+		// Ministers with higher first-ACK rate get up to 20% bonus.
+		firstACKRate, _ := db.GetMinisterFirstACKRate(m.ID)
+		score := quality * (1.0 + firstACKRate*0.2) / float64(load+1)
 		ranked = append(ranked, scored{m, score})
 	}
 
@@ -1318,7 +1474,7 @@ func (db *DB) DB() *sql.DB {
 	return db.conn
 }
 
-// Ping checks database connectivity
+// Ping checks database connectivity.
 func (db *DB) Ping(ctx context.Context) error {
 	return db.conn.PingContext(ctx)
 }
@@ -1408,4 +1564,115 @@ func (db *DB) ListEventsBySession(sessionID string) ([]*Event, error) {
 		events = append(events, &e)
 	}
 	return events, nil
+}
+
+// ─── Phase 4: C-3 Hansard Timeline ──────────────────────────────────────────
+
+// ListHansardBySession returns hansard entries for bills in a session, oldest first.
+func (db *DB) ListHansardBySession(sessionID string) ([]*Hansard, error) {
+	rows, err := db.conn.Query(
+		`SELECT h.id, h.minister_id, h.bill_id, COALESCE(h.outcome,''), COALESCE(h.duration_s,0), COALESCE(h.skills_used,''), COALESCE(h.quality,0), COALESCE(h.notes,''), h.created_at
+		 FROM hansard h JOIN bills b ON h.bill_id = b.id
+		 WHERE b.session_id = ? ORDER BY h.created_at ASC`, sessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []*Hansard
+	for rows.Next() {
+		var h Hansard
+		if err := rows.Scan(&h.ID, &h.MinisterID, &h.BillID, &h.Outcome, &h.DurationS, &h.SkillsUsed, &h.Quality, &h.Notes, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, &h)
+	}
+	return entries, nil
+}
+
+// ─── Phase 4: B-1.4 Question Time Metrics ──────────────────────────────────
+
+// CountACKRoundsForBill counts the number of question-type gazettes for a bill.
+func (db *DB) CountACKRoundsForBill(billID string) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM gazettes WHERE bill_id = ? AND type = 'question'`, billID,
+	).Scan(&count)
+	return count, err
+}
+
+// FirstACKRate returns the ratio of bills in a session that had zero question rounds.
+func (db *DB) FirstACKRate(sessionID string) (float64, error) {
+	rows, err := db.conn.Query(
+		`SELECT b.id FROM bills b WHERE b.session_id = ? AND (b.status = 'enacted' OR b.status = 'royal_assent')`,
+		sessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	total := 0
+	zeroRounds := 0
+	for rows.Next() {
+		var billID string
+		if err := rows.Scan(&billID); err != nil {
+			return 0, err
+		}
+		total++
+		count, _ := db.CountACKRoundsForBill(billID)
+		if count == 0 {
+			zeroRounds++
+		}
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	return float64(zeroRounds) / float64(total), nil
+}
+
+// GetMinisterFirstACKRate returns the first-ACK rate (zero question rounds) for a minister.
+func (db *DB) GetMinisterFirstACKRate(ministerID string) (float64, error) {
+	rows, err := db.conn.Query(
+		`SELECT h.bill_id FROM hansard h WHERE h.minister_id = ? AND h.outcome = 'enacted'`,
+		ministerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	total := 0
+	zeroRounds := 0
+	for rows.Next() {
+		var billID string
+		if err := rows.Scan(&billID); err != nil {
+			return 0, err
+		}
+		total++
+		count, _ := db.CountACKRoundsForBill(billID)
+		if count == 0 {
+			zeroRounds++
+		}
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	return float64(zeroRounds) / float64(total), nil
+}
+
+// UpdateHansardMetrics updates ACK rounds and briefing time on a hansard record.
+func (db *DB) UpdateHansardMetrics(hansardID string, ackRounds, briefingTimeS int) error {
+	_, err := db.conn.Exec(
+		`UPDATE hansard SET ack_rounds = ?, briefing_time_s = ? WHERE id = ?`,
+		ackRounds, briefingTimeS, hansardID,
+	)
+	return err
+}
+
+// ClearMinisterWorktree clears the worktree field for a minister.
+func (db *DB) ClearMinisterWorktree(id string) error {
+	_, err := db.conn.Exec(`UPDATE ministers SET worktree = '' WHERE id = ?`, id)
+	return err
 }

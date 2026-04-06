@@ -12,10 +12,11 @@ var eventsCmd = &cobra.Command{
 	Short: "查看事件日志 (Event Ledger)",
 	Long:  "查看系统事件日志，支持按主题、议案、部长筛选",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
+//nolint:gochecknoinits // Cobra convention: register subcommands in init().
 func init() {
 	eventsCmd.AddCommand(eventsListCmd)
 	eventsCmd.AddCommand(eventsTimelineCmd)

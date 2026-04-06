@@ -358,7 +358,7 @@ func TestFullSessionLifecycle_Pipeline(t *testing.T) {
 	if err := tdb.UpdateBillStatus("bill-a", "reading"); err != nil {
 		t.Fatalf("UpdateBillStatus A: %v", err)
 	}
-	if err := tdb.EnactBillFromDone("bill-a", "minister-a", "Bill A complete"); err != nil {
+	if err := tdb.EnactBillFromDone("bill-a", "minister-a", "Bill A complete", ""); err != nil {
 		t.Fatalf("EnactBillFromDone A: %v", err)
 	}
 
@@ -388,7 +388,7 @@ func TestFullSessionLifecycle_Pipeline(t *testing.T) {
 	if err := tdb.UpdateBillStatus("bill-b", "reading"); err != nil {
 		t.Fatalf("UpdateBillStatus B: %v", err)
 	}
-	if err := tdb.EnactBillFromDone("bill-b", "minister-b", "Bill B complete"); err != nil {
+	if err := tdb.EnactBillFromDone("bill-b", "minister-b", "Bill B complete", ""); err != nil {
 		t.Fatalf("EnactBillFromDone B: %v", err)
 	}
 
@@ -541,7 +541,7 @@ func TestHansardQualityScoring(t *testing.T) {
 	if err := tdb.CreateBill(b); err != nil {
 		t.Fatalf("CreateBill: %v", err)
 	}
-	if err := tdb.EnactBillFromDone("bill-qs1", "m-qscore", "tests pass, reviewed"); err != nil {
+	if err := tdb.EnactBillFromDone("bill-qs1", "m-qscore", "tests pass, reviewed", ""); err != nil {
 		t.Fatalf("EnactBillFromDone: %v", err)
 	}
 
@@ -657,6 +657,119 @@ func TestSessionStatsIntegration(t *testing.T) {
 	}
 	if stats.Ministers[0].Enacted != 2 {
 		t.Errorf("minister enacted: got %d, want 2", stats.Ministers[0].Enacted)
+	}
+}
+
+// ─── Scenario 10: Pipeline with structured payload gazette ───────────────────
+// Verify that EnactBillFromDone with payload creates a gazette containing structured data,
+// and that downstream gazette sections use the structured format.
+
+func TestPipelineStructuredPayload(t *testing.T) {
+	tdb := setupTestDB(t)
+
+	sid := "session-payload"
+	sess := &store.Session{
+		ID:       sid,
+		Title:    "Payload Pipeline",
+		Topology: "pipeline",
+		Status:   "active",
+	}
+	if err := tdb.CreateSession(sess); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Create ministers.
+	for _, mid := range []string{"m-up", "m-down"} {
+		m := &store.Minister{ID: mid, Title: "Minister " + mid, Runtime: "claude-code", Skills: `["go"]`, Status: "idle"}
+		if err := tdb.CreateMinister(m); err != nil {
+			t.Fatalf("CreateMinister %s: %v", mid, err)
+		}
+	}
+
+	// Create pipeline: A → B.
+	billA := &store.Bill{ID: "bill-pay-a", SessionID: store.NullString(sid), Title: "Bill A", Status: "draft", DependsOn: store.NullString("[]")}
+	billB := &store.Bill{ID: "bill-pay-b", SessionID: store.NullString(sid), Title: "Bill B", Status: "draft", DependsOn: store.NullString(`["bill-pay-a"]`)}
+	for _, b := range []*store.Bill{billA, billB} {
+		if err := tdb.CreateBill(b); err != nil {
+			t.Fatalf("CreateBill %s: %v", b.ID, err)
+		}
+	}
+
+	// Assign and complete A with structured payload.
+	_ = tdb.AssignBill("bill-pay-a", "m-up")
+	_ = tdb.UpdateBillStatus("bill-pay-a", "reading")
+	payloadJSON := `{"summary":"Auth service implemented","contracts":{"auth.go":"AuthService interface"},"artifacts":{"internal/auth.go":"新增"},"assumptions":{"api":"v2 assumed"}}`
+	if err := tdb.EnactBillFromDone("bill-pay-a", "m-up", "Auth service implemented", payloadJSON); err != nil {
+		t.Fatalf("EnactBillFromDone: %v", err)
+	}
+
+	// Verify the completion gazette has the payload.
+	gazettes, err := tdb.ListGazettesForBill("bill-pay-a")
+	if err != nil {
+		t.Fatalf("ListGazettesForBill: %v", err)
+	}
+	if len(gazettes) == 0 {
+		t.Fatal("expected at least 1 gazette for bill-pay-a")
+	}
+
+	found := false
+	for _, g := range gazettes {
+		if g.Type.String == "completion" && g.Payload != "" {
+			found = true
+			if !strings.Contains(g.Payload, "AuthService") {
+				t.Error("gazette payload should contain contract data")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected completion gazette with payload for bill-pay-a")
+	}
+}
+
+// ─── Scenario 11: Session ACK mode and EffectiveAckMode ─────────────────────
+
+func TestSessionEffectiveAckMode(t *testing.T) {
+	tdb := setupTestDB(t)
+
+	// Pipeline session → auto resolves to blocking.
+	sess1 := &store.Session{ID: "sess-ack-1", Title: "Pipeline ACK", Topology: "pipeline", Status: "active"}
+	if err := tdb.CreateSession(sess1); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	loaded, err := tdb.GetSession("sess-ack-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if loaded.EffectiveAckMode() != "blocking" {
+		t.Errorf("pipeline session should default to blocking, got %q", loaded.EffectiveAckMode())
+	}
+
+	// Parallel session → auto resolves to non-blocking.
+	sess2 := &store.Session{ID: "sess-ack-2", Title: "Parallel ACK", Topology: "parallel", Status: "active"}
+	if err := tdb.CreateSession(sess2); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	loaded2, err := tdb.GetSession("sess-ack-2")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if loaded2.EffectiveAckMode() != "non-blocking" {
+		t.Errorf("parallel session should default to non-blocking, got %q", loaded2.EffectiveAckMode())
+	}
+
+	// Verify ListActiveSessions also returns ack_mode.
+	active, err := tdb.ListActiveSessions()
+	if err != nil {
+		t.Fatalf("ListActiveSessions: %v", err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active sessions, got %d", len(active))
+	}
+	for _, s := range active {
+		mode := s.EffectiveAckMode()
+		if mode != "blocking" && mode != "non-blocking" {
+			t.Errorf("unexpected ack mode %q for session %s", mode, s.ID)
+		}
 	}
 }
 

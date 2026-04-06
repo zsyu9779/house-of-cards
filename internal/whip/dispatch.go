@@ -4,18 +4,16 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"github.com/house-of-cards/hoc/internal/store"
 	"github.com/house-of-cards/hoc/internal/util"
 )
 
-// ─── Gazette Dispatch (8-3 enhanced) ─────────────────────────────────────────
+// ─── Gazette Dispatch (unified file inbox) ──────────────────────────────────
 
 // gazetteDispatch routes unread Gazettes.
-// For targeted Gazettes (to_minister set): attempts tmux send-keys delivery first,
-// falls back to writing an inbox file in the minister's chamber.
+// For targeted Gazettes (to_minister set): writes to the minister's chamber inbox.
 // Broadcast Gazettes are only logged.
 func (w *Whip) gazetteDispatch() {
 	gazettes, err := w.db.ListUnreadGazettes()
@@ -41,32 +39,14 @@ func (w *Whip) gazetteDispatch() {
 	}
 }
 
-// deliverGazette delivers a gazette to its target minister.
-// Strategy 1: tmux send-keys (if minister has an active tmux session).
-// Strategy 2: write to <chamber>/.hoc/inbox/<gazette-id>.md.
+// deliverGazette delivers a gazette to its target minister via file inbox.
+// Writes to <chamber>/.hoc/inbox/<gazette-id>.md and creates a gazette-signal marker.
 func (w *Whip) deliverGazette(g *store.Gazette) {
 	ministerID := g.ToMinister.String
 	if ministerID == "" {
 		return
 	}
 
-	// Try tmux delivery first.
-	tmuxName := fmt.Sprintf("hoc-%s", ministerID)
-	if exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
-		msg := fmt.Sprintf("\n[公报 | 来自: %s | 类型: %s]\n%s\n",
-			util.OrDash(g.FromMinister.String),
-			util.OrDash(g.Type.String),
-			g.Summary,
-		)
-		cmd := exec.Command("tmux", "send-keys", "-t", tmuxName, msg, "")
-		if err := cmd.Run(); err == nil {
-			slog.Debug("公报已发送至 tmux", "minister", ministerID)
-			_ = w.db.RecordEvent("gazette.delivered", "whip", g.BillID.String, ministerID, "", fmt.Sprintf(`{"method":"tmux","gazette_id":"%s"}`, g.ID))
-			return
-		}
-	}
-
-	// Fallback: write to chamber inbox.
 	minister, err := w.db.GetMinister(ministerID)
 	if err != nil || minister.Worktree.String == "" {
 		return
@@ -84,9 +64,24 @@ func (w *Whip) deliverGazette(g *store.Gazette) {
 		g.CreatedAt.Format("2006-01-02 15:04:05"),
 		g.Summary,
 	)
+
+	// Append structured payload section if available.
+	if g.Payload != "" {
+		content += "\n---\n\n## 结构化数据\n\n```json\n" + g.Payload + "\n```\n"
+	}
+
 	filename := filepath.Join(inboxDir, g.ID+".md")
-	if err := os.WriteFile(filename, []byte(content), 0644); err == nil {
-		slog.Debug("公报已写入 inbox", "minister", ministerID, "file", filename)
-		_ = w.db.RecordEvent("gazette.delivered", "whip", g.BillID.String, ministerID, "", fmt.Sprintf(`{"method":"inbox","gazette_id":"%s"}`, g.ID))
+	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+		slog.Warn("deliverGazette: write inbox file", "err", err)
+		return
+	}
+
+	// Write gazette-signal marker to notify the minister's agent.
+	signalPath := filepath.Join(minister.Worktree.String, ".hoc", "gazette-signal")
+	_ = os.WriteFile(signalPath, []byte{}, 0644) // best-effort: gazette 信号文件
+
+	slog.Debug("公报已写入 inbox", "minister", ministerID, "file", filename)
+	if err := w.db.RecordEvent("gazette.delivered", "whip", g.BillID.String, ministerID, "", fmt.Sprintf(`{"method":"inbox","gazette_id":"%s"}`, g.ID)); err != nil {
+		slog.Warn("记录 gazette.delivered 事件失败", "gazette_id", g.ID, "err", err)
 	}
 }
