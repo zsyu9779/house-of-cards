@@ -1,10 +1,16 @@
 package whip
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/house-of-cards/hoc/internal/store"
 )
+
+// contains is a shared test helper.
+func contains(s, sub string) bool {
+	return strings.Contains(s, sub)
+}
 
 // newTestWhip creates a Whip bound to a real in-memory SQLite DB for integration tests.
 func newTestWhip(t *testing.T) (*Whip, *store.DB) {
@@ -240,6 +246,23 @@ func mustCreateIdleMinister(t *testing.T, db *store.DB, id string) {
 	}
 	if err := db.CreateMinister(m); err != nil {
 		t.Fatalf("CreateMinister %s: %v", id, err)
+	}
+}
+
+// mustCreateBillFull creates a bill with portfolio and parent_bill fields.
+func mustCreateBillFull(t *testing.T, db *store.DB, id, sessionID, title, status, deps, portfolio, parentBill string) {
+	t.Helper()
+	b := &store.Bill{
+		ID:         id,
+		SessionID:  store.NullString(sessionID),
+		Title:      title,
+		Status:     status,
+		DependsOn:  store.NullString(deps),
+		Portfolio:  store.NullString(portfolio),
+		ParentBill: parentBill,
+	}
+	if err := db.CreateBill(b); err != nil {
+		t.Fatalf("CreateBill %s: %v", id, err)
 	}
 }
 

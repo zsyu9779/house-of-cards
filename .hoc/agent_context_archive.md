@@ -1,5 +1,14 @@
 # Agent Context Archive
 
+## 2026-04-06 — v0.3 Phase 1 完成总结
+
+Phase 1 全部 4 个 PR 完成：
+- PR-1: C-1 Linter 升级
+- PR-2: E-1.1 Whip 错误治理
+- PR-3: E-1.2 Serve 错误治理
+- PR-4: E-2 配置校验（17 个测试 + ValidationError）
+Gate 验证通过：golangci-lint 零 error，go test -race 全 PASS。
+
 ## 2026-04-06 — v0.3 Phase 1 PR-2 完成记录
 
 ### PR-2: E-1.1 Whip 错误治理 + 恢复梯度

@@ -107,6 +107,52 @@ func TestDeliverGazette_WithPayload(t *testing.T) {
 	}
 }
 
+func TestGazetteDispatch_RoutesAndMarksRead(t *testing.T) {
+	w, db := newTestWhip(t)
+
+	worktree := t.TempDir()
+	m := &store.Minister{
+		ID:      "m-dispatch",
+		Title:   "Dispatch Minister",
+		Runtime: "claude-code",
+		Status:  "working",
+	}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("CreateMinister: %v", err)
+	}
+	if err := db.UpdateMinisterWorktree("m-dispatch", worktree); err != nil {
+		t.Fatalf("UpdateMinisterWorktree: %v", err)
+	}
+
+	// Create a targeted unread gazette.
+	g := &store.Gazette{
+		ID:           "gaz-dispatch-1",
+		FromMinister: store.NullString("whip"),
+		ToMinister:   store.NullString("m-dispatch"),
+		Type:         store.NullString("handoff"),
+		Summary:      "Dispatch test gazette",
+	}
+	if err := db.CreateGazette(g); err != nil {
+		t.Fatalf("CreateGazette: %v", err)
+	}
+
+	w.gazetteDispatch()
+
+	// Gazette should be marked as read.
+	unread, _ := db.ListUnreadGazettes()
+	for _, u := range unread {
+		if u.ID == "gaz-dispatch-1" {
+			t.Error("gazette should be marked read after dispatch")
+		}
+	}
+
+	// Inbox file should exist.
+	inboxFile := filepath.Join(worktree, ".hoc", "inbox", "gaz-dispatch-1.md")
+	if _, err := os.Stat(inboxFile); os.IsNotExist(err) {
+		t.Error("inbox file should exist after gazette dispatch")
+	}
+}
+
 func TestDeliverGazette_NoWorktree(t *testing.T) {
 	w, db := newTestWhip(t)
 
