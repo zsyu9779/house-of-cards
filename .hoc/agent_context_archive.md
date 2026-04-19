@@ -1,5 +1,16 @@
 # Agent Context Archive
 
+## 2026-04-19 — v0.3.1 清尾完成
+
+- **阶段**: v0.3.1 清尾完成 ✅（Phase 4A / 4B / 4C / 4D 全部落地）
+- 总覆盖率 48.0% → 60.3%
+- 四 Gate 全绿、7 条 Checklist 全过
+- 待办：补 CHANGELOG → 打 v0.3.0 tag → 推送 remote
+
+详见原 agent_context.md 归档。
+
+---
+
 ## 2026-04-19 — v0.3 Phase 3 PR-13 E-3 OTLP stub 标注
 
 三处改动：`internal/config/config.go` `Validate()` 显式拒绝 `"otlp"`；`internal/otel/tracer.go` `NewOTLPExporter` 加 `slog.Warn`；`cmd/doctor.go` 新增 Step 8 检查。测试 `TestDoctor_OTLPStubFlagged`、config_test `otlp exporter is stub`。build/vet/lint/race 全绿。

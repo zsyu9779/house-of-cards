@@ -180,6 +180,8 @@ func (m floorModel) View() string {
 		return m.viewGazetteList()
 	case viewSession:
 		return m.viewSessionDetail()
+	case viewMain:
+		return m.viewMain()
 	default:
 		return m.viewMain()
 	}

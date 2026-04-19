@@ -79,6 +79,8 @@ func ComplexityIcon(c Complexity) string {
 	switch c {
 	case ComplexitySimple:
 		return "🟢"
+	case ComplexityMedium:
+		return "🟡"
 	case ComplexityComplex:
 		return "🔴"
 	default:
