@@ -42,16 +42,16 @@ linters:
     godot:
       scope: declarations
       period: true
+  exclusions:
+    rules:
+      # Test files can use init().
+      - path: _test\.go
+        linters:
+          - gochecknoinits
+      # Test files don't need exhaustive switch.
+      - path: _test\.go
+        linters:
+          - exhaustive
 
-issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # Test files can use init().
-    - path: _test\.go
-      linters:
-        - gochecknoinits
-    # Test files don't need exhaustive switch.
-    - path: _test\.go
-      linters:
-        - exhaustive
