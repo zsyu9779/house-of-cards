@@ -674,4 +674,3 @@ var billSplitCmd = &cobra.Command{
 		return nil
 	},
 }
-

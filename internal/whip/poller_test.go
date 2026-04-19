@@ -418,4 +418,3 @@ func TestCollectQuestionMetrics(t *testing.T) {
 	}
 	// If no ack_rounds updated, the function ran without error — acceptable
 }
-

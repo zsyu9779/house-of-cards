@@ -19,10 +19,10 @@ func TestOrDash(t *testing.T) {
 
 func TestTruncate(t *testing.T) {
 	cases := []struct {
-		name     string
-		s        string
-		max      int
-		want     string
+		name string
+		s    string
+		max  int
+		want string
 	}{
 		{"shorter than max", "abc", 10, "abc"},
 		{"equal to max", "abcdef", 6, "abcdef"},

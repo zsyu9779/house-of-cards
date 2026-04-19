@@ -64,11 +64,11 @@ func TestReport_WithDataAndHistory(t *testing.T) {
 	mustCreateIdleMinister(t, db, "m-report")
 
 	g := &store.Gazette{
-		ID:      "gaz-report-1",
+		ID:         "gaz-report-1",
 		ToMinister: store.NullString("m-report"),
-		BillID:  store.NullString("bill-report-1"),
-		Type:    store.NullString("handoff"),
-		Summary: "Hand off",
+		BillID:     store.NullString("bill-report-1"),
+		Type:       store.NullString("handoff"),
+		Summary:    "Hand off",
 	}
 	if err := db.CreateGazette(g); err != nil {
 		t.Fatalf("CreateGazette: %v", err)
@@ -112,4 +112,3 @@ func TestReport_WithDataAndHistory(t *testing.T) {
 		t.Error("report with history should contain event log section")
 	}
 }
-

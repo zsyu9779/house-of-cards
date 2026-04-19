@@ -41,17 +41,17 @@ func TestBillStatusIcon(t *testing.T) {
 
 func TestTopicIcon(t *testing.T) {
 	cases := map[string]bool{
-		"bill.created":        true,
-		"bill.assigned":       true,
-		"bill.enacted":        true,
-		"minister.stuck":      true,
-		"session.completed":   true,
-		"by_election.fired":   true,
-		"gazette.created":     true,
-		"privy.merged":        true,
-		"committee.passed":    true,
-		"governance.paused":   true,
-		"some.unknown.topic":  true,
+		"bill.created":       true,
+		"bill.assigned":      true,
+		"bill.enacted":       true,
+		"minister.stuck":     true,
+		"session.completed":  true,
+		"by_election.fired":  true,
+		"gazette.created":    true,
+		"privy.merged":       true,
+		"committee.passed":   true,
+		"governance.paused":  true,
+		"some.unknown.topic": true,
 	}
 	for topic := range cases {
 		if icon := topicIcon(topic); icon == "" {

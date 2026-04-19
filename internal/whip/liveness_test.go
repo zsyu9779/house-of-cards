@@ -371,4 +371,3 @@ func TestByElection_WithWorktreeNoGit(t *testing.T) {
 		}
 	}
 }
-

@@ -395,16 +395,16 @@ func TestScaleThresholds(t *testing.T) {
 
 func TestShouldScaleUp(t *testing.T) {
 	tests := []struct {
-		name                       string
-		pending, idle, threshold   int
-		want                       bool
+		name                     string
+		pending, idle, threshold int
+		want                     bool
 	}{
 		{"no pending", 0, 0, 2, false},
-		{"under threshold", 2, 1, 2, false},                // 2 > 1*2? no, 2 > 2 = false
-		{"exactly threshold", 4, 2, 2, false},              // 4 > 4 = false
-		{"just over threshold", 5, 2, 2, true},             // 5 > 4
-		{"zero idle with pending", 1, 0, 2, true},          // 1 > 0
-		{"large backlog", 10, 1, 2, true},                  // 10 > 2
+		{"under threshold", 2, 1, 2, false},       // 2 > 1*2? no, 2 > 2 = false
+		{"exactly threshold", 4, 2, 2, false},     // 4 > 4 = false
+		{"just over threshold", 5, 2, 2, true},    // 5 > 4
+		{"zero idle with pending", 1, 0, 2, true}, // 1 > 0
+		{"large backlog", 10, 1, 2, true},         // 10 > 2
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -423,10 +423,10 @@ func TestShouldScaleDown(t *testing.T) {
 		want                     bool
 	}{
 		{"balanced", 1, 1, 2, false},
-		{"idle equal to threshold", 0, 2, 2, false},   // floor: never drain to 0
+		{"idle equal to threshold", 0, 2, 2, false}, // floor: never drain to 0
 		{"idle over threshold no pending", 0, 3, 2, true},
-		{"excess idle with pending", 1, 4, 2, true},   // 4 > 1+2 && 4 > 2
-		{"pending absorbs slack", 3, 4, 2, false},     // 4 > 3+2? no
+		{"excess idle with pending", 1, 4, 2, true}, // 4 > 1+2 && 4 > 2
+		{"pending absorbs slack", 3, 4, 2, false},   // 4 > 3+2? no
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -659,4 +659,3 @@ func TestEffectiveAckMode(t *testing.T) {
 		})
 	}
 }
-
