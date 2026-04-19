@@ -1138,7 +1138,7 @@ func TestDoctor_FixMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer fresh.Close()
+	defer func() { _ = fresh.Close() }()
 	m, _ := fresh.GetMinister("m-stuck")
 	if m.Status != "idle" {
 		t.Errorf("status after --fix: got %q, want idle", m.Status)

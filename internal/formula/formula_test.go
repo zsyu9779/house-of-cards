@@ -80,7 +80,7 @@ name = "step-one"
 	if _, err := tmp.WriteString(toml); err != nil {
 		t.Fatal(err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	f, err := formula.LoadFromFile(tmp.Name())
 	if err != nil {

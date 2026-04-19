@@ -51,7 +51,7 @@ var doctorCmd = &cobra.Command{
 				}
 			}
 			fmt.Printf("✅  %s%s\n", dbPath, sizeStr)
-			defer d.Close()
+			defer func() { _ = d.Close() }()
 		}
 
 		// ── 2. External tools ────────────────────────────────────

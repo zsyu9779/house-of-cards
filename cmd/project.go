@@ -63,7 +63,7 @@ var projectAddCmd = &cobra.Command{
 		gitCmd.Stderr = os.Stderr
 		if err := gitCmd.Run(); err != nil {
 			// Clean up on failure
-			os.RemoveAll(projectDir)
+			_ = os.RemoveAll(projectDir)
 			return fmt.Errorf("git clone 失败: %w", err)
 		}
 

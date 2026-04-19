@@ -59,7 +59,7 @@ var whipStartCmd = &cobra.Command{
 		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 			slog.Warn("could not write PID file", "err", err)
 		}
-		defer os.Remove(pidFile)
+		defer func() { _ = os.Remove(pidFile) }()
 
 		fmt.Printf("🎯 党鞭启动 (PID: %d)  PID 文件: %s\n", os.Getpid(), pidFile)
 		fmt.Printf("   按 Ctrl+C 停止，或运行 `hoc whip stop` 从另一终端停止。\n\n")

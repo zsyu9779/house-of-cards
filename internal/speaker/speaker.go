@@ -67,6 +67,7 @@ func WriteContext(hocDir, content string) error {
 		return fmt.Errorf("create speaker dir: %w", err)
 	}
 	path := filepath.Join(hocDir, contextRelPath)
+	path = filepath.Clean(path)
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
@@ -211,9 +212,9 @@ func writePatrolPrompt(path, contextContent string) error {
 
 ## 你的决策（仅输出指令行和简短说明）：
 `, contextContent)
+	path = filepath.Clean(path)
 	return os.WriteFile(path, []byte(content), 0644)
 }
-
 // SummonResult carries the outcome of a Speaker summon for the CLI caller.
 // TmuxSession is the tmux session name when the speaker was started in
 // detached mode; it is empty for interactive (foreground) runs.
@@ -231,7 +232,7 @@ type SummonResult struct {
 func Summon(hocDir string, useTmux bool) (SummonResult, error) {
 	ctxPath := ContextPath(hocDir)
 	if _, err := os.Stat(ctxPath); os.IsNotExist(err) {
-		return SummonResult{}, fmt.Errorf("Speaker context 文件不存在：%s\n请先运行 hoc speaker context --refresh", ctxPath)
+		return SummonResult{}, fmt.Errorf("speaker context 文件不存在：%s\n请先运行 hoc speaker context --refresh", ctxPath)
 	}
 
 	// Read the context content to embed directly in the prompt.
@@ -319,6 +320,7 @@ func writeSpeakerPrompt(path string, contextContent string) error {
 
 *议长就绪，请指示。*
 `, time.Now().Format("2006-01-02 15:04:05"), contextContent)
+	path = filepath.Clean(path)
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
@@ -378,7 +380,7 @@ func renderContext(data *ContextData) string {
 	var sb strings.Builder
 
 	sb.WriteString("# Speaker Context（议长备忘录）\n\n")
-	sb.WriteString(fmt.Sprintf("> 生成时间：%s\n\n", data.GeneratedAt.Format("2006-01-02 15:04:05")))
+	fmt.Fprintf(&sb, "> 生成时间：%s\n\n", data.GeneratedAt.Format("2006-01-02 15:04:05"))
 	sb.WriteString("---\n\n")
 
 	// Count minister status breakdowns (reused across sections).
@@ -405,9 +407,9 @@ func renderContext(data *ContextData) string {
 			activeSessions++
 		}
 	}
-	sb.WriteString(fmt.Sprintf("- 活跃会期：%d 个（共 %d 个）\n", activeSessions, len(data.AllSessions)))
-	sb.WriteString(fmt.Sprintf("- 内阁：%d 位部长（工作中 %d / 待命 %d / 卡住 %d / 离线 %d）\n\n",
-		total, working, idle, stuck, offline))
+	fmt.Fprintf(&sb, "- 活跃会期：%d 个（共 %d 个）\n", activeSessions, len(data.AllSessions))
+	fmt.Fprintf(&sb, "- 内阁：%d 位部长（工作中 %d / 待命 %d / 卡住 %d / 离线 %d）\n\n",
+		total, working, idle, stuck, offline)
 
 	// Resource utilization.
 	sb.WriteString("## 资源利用率\n\n")
@@ -428,11 +430,14 @@ func renderContext(data *ContextData) string {
 		sb.WriteString("暂无会期。\n\n")
 	}
 	for _, ss := range data.ActiveSessions {
-		icon := "🟢"
-		if ss.Session.Status == "completed" {
+		var icon string
+		switch ss.Session.Status {
+		case "completed":
 			icon = "✅"
-		} else if ss.Session.Status == "dissolved" {
+		case "dissolved":
 			icon = "⚫"
+		default:
+			icon = "🟢"
 		}
 		topology := ss.Session.Topology
 		sb.WriteString(fmt.Sprintf("### %s %s [%s] (%d/%d Bills) | 拓扑: `%s`\n\n",

@@ -269,13 +269,16 @@ var sessionStatusCmd = &cobra.Command{
 		}
 
 		for _, s := range sessions {
-			statusIcon := "🟢"
-			if s.Status == "completed" {
+			var statusIcon string
+			switch s.Status {
+			case "completed":
 				statusIcon = "✅"
-			} else if s.Status == "dissolved" {
+			case "dissolved":
 				statusIcon = "⚫"
-			} else if s.Status == "paused" {
+			case "paused":
 				statusIcon = "⏸"
+			default:
+				statusIcon = "🟢"
 			}
 			projStr := ""
 			if s.Project.String != "" {
@@ -568,11 +571,14 @@ func showAllSessionStats() error {
 }
 
 func printSessionStats(stats *store.SessionStats) {
-	statusIcon := "🟢"
-	if stats.Status == "completed" {
+	var statusIcon string
+	switch stats.Status {
+	case "completed":
 		statusIcon = "✅"
-	} else if stats.Status == "dissolved" {
+	case "dissolved":
 		statusIcon = "⚫"
+	default:
+		statusIcon = "🟢"
 	}
 
 	fmt.Printf("📊 会期统计 — \"%s\" [%s]\n", stats.Title, stats.SessionID)
@@ -906,11 +912,14 @@ func buildReplayTimeline(events []*store.Event, hansards []*store.Hansard) []str
 	}
 
 	for _, h := range hansards {
-		icon := "📜"
-		if h.Outcome.String == "enacted" {
+		var icon string
+		switch h.Outcome.String {
+		case "enacted":
 			icon = "✅"
-		} else if h.Outcome.String == "failed" {
+		case "failed":
 			icon = "❌"
+		default:
+			icon = "📜"
 		}
 		qualStr := ""
 		if h.Quality > 0 {

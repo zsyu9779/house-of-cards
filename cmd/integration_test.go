@@ -33,7 +33,7 @@ func setupTestDB(t *testing.T) *store.DB {
 	hocDir = dir
 
 	t.Cleanup(func() {
-		testDB.Close()
+		_ = testDB.Close()
 		db = nil
 		hocDir = ""
 	})
@@ -789,7 +789,7 @@ func TestInitDBIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	defer testDB.Close()
+	defer func() { _ = testDB.Close() }()
 
 	// Should have no ministers initially.
 	ministers, err := testDB.ListMinisters()

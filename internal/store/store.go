@@ -242,7 +242,7 @@ func (db *DB) ListMinisters() ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -264,7 +264,7 @@ func (db *DB) ListMinistersWithWorktree() ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -392,7 +392,7 @@ func (db *DB) ListSessions() ([]*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []*Session
 	for rows.Next() {
@@ -456,7 +456,7 @@ func (db *DB) GetDownstreamBills(billID string) ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -474,7 +474,7 @@ func (db *DB) ListBills() ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -579,7 +579,7 @@ func (db *DB) ListGazettesForMinister(ministerID string) ([]*Gazette, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var gazettes []*Gazette
 	for rows.Next() {
@@ -634,7 +634,7 @@ func (db *DB) ListBillsBySession(sessionID string) ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -655,7 +655,7 @@ func (db *DB) ListGazettes() ([]*Gazette, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var gazettes []*Gazette
 	for rows.Next() {
@@ -676,7 +676,7 @@ func (db *DB) ListGazettesForBill(billID string) ([]*Gazette, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var gazettes []*Gazette
 	for rows.Next() {
@@ -708,7 +708,7 @@ func (db *DB) ListBillsWithBranchBySession(sessionID string) ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -730,7 +730,7 @@ func (db *DB) ListHansard() ([]*Hansard, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Hansard
 	for rows.Next() {
@@ -752,7 +752,7 @@ func (db *DB) ListHansardByMinister(ministerID string) ([]*Hansard, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Hansard
 	for rows.Next() {
@@ -774,7 +774,7 @@ func (db *DB) GetBillsByAssignee(ministerID string) ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -804,7 +804,7 @@ func (db *DB) HansardSuccessRate(ministerID string) (enacted, total int, err err
 	if err != nil {
 		return 0, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var outcome string
@@ -828,7 +828,7 @@ func (db *DB) ListMinistersWithStatus(status string) ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -850,7 +850,7 @@ func (db *DB) ListWorkingMinisters() ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -873,7 +873,7 @@ func (db *DB) ListOfflineMinisters() ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -896,7 +896,7 @@ func (db *DB) ListIdleMinistersForSkill(skill string) ([]*Minister, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ministers []*Minister
 	for rows.Next() {
@@ -929,7 +929,7 @@ func (db *DB) ListActiveSessions() ([]*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []*Session
 	for rows.Next() {
@@ -951,7 +951,7 @@ func (db *DB) ListUnreadGazettes() ([]*Gazette, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var gazettes []*Gazette
 	for rows.Next() {
@@ -1015,7 +1015,7 @@ func (db *DB) ListRecentHansard(limit int) ([]*Hansard, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Hansard
 	for rows.Next() {
@@ -1072,7 +1072,7 @@ func (db *DB) ListSubBills(parentID string) ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -1094,7 +1094,7 @@ func (db *DB) ListBillsForCommittee() ([]*Bill, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bills []*Bill
 	for rows.Next() {
@@ -1127,7 +1127,7 @@ func (db *DB) ListByElectionHansard(limit int) ([]*Hansard, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Hansard
 	for rows.Next() {
@@ -1596,7 +1596,7 @@ func (db *DB) ListEvents(topic, billID, ministerID string, since time.Duration) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var events []*Event
 	for rows.Next() {
@@ -1618,7 +1618,7 @@ func (db *DB) ListEventsBySession(sessionID string) ([]*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var events []*Event
 	for rows.Next() {
@@ -1643,7 +1643,7 @@ func (db *DB) ListHansardBySession(sessionID string) ([]*Hansard, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Hansard
 	for rows.Next() {
@@ -1676,7 +1676,7 @@ func (db *DB) FirstACKRate(sessionID string) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	total := 0
 	zeroRounds := 0
@@ -1706,7 +1706,7 @@ func (db *DB) GetMinisterFirstACKRate(ministerID string) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	total := 0
 	zeroRounds := 0

@@ -20,7 +20,7 @@ func newTestWhip(t *testing.T) (*Whip, *store.DB) {
 	if err != nil {
 		t.Fatalf("store.NewDB: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	w := New(db, dir)
 	return w, db
 }

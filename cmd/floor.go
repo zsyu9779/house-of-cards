@@ -288,14 +288,18 @@ func (m floorModel) viewMain() string {
 		sb.WriteString(styleSubtle.Render("  (暂无会期)") + "\n")
 	}
 	for _, s := range m.sessions {
-		statusIcon := "🟢"
-		lineStyle := styleWorking
-		if s.Status == "completed" {
+		var statusIcon string
+		var lineStyle lipgloss.Style
+		switch s.Status {
+		case "completed":
 			statusIcon = "✅"
 			lineStyle = styleEnacted
-		} else if s.Status == "dissolved" {
+		case "dissolved":
 			statusIcon = "⚫"
 			lineStyle = styleSubtle
+		default:
+			statusIcon = "🟢"
+			lineStyle = styleWorking
 		}
 
 		bills := m.bills[s.ID]
@@ -456,14 +460,18 @@ func (m floorModel) viewSessionDetail() string {
 	}
 
 	for _, s := range m.sessions {
-		statusIcon := "🟢"
-		lineStyle := styleWorking
-		if s.Status == "completed" {
+		var statusIcon string
+		var lineStyle lipgloss.Style
+		switch s.Status {
+		case "completed":
 			statusIcon = "✅"
 			lineStyle = styleEnacted
-		} else if s.Status == "dissolved" {
+		case "dissolved":
 			statusIcon = "⚫"
 			lineStyle = styleSubtle
+		default:
+			statusIcon = "🟢"
+			lineStyle = styleWorking
 		}
 
 		bills := m.bills[s.ID]

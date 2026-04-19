@@ -432,7 +432,7 @@ func TestStoreCoverage_AllCRUD(t *testing.T) {
 	})
 
 	t.Run("DB+Ping", func(t *testing.T) {
-		var raw *sql.DB = db.DB()
+		raw := db.DB()
 		if raw == nil {
 			t.Fatal("DB() returned nil")
 		}

@@ -90,7 +90,7 @@ func runFormulaApply(_ *cobra.Command, args []string) error {
 
 	f := reg.Get(name)
 	if f == nil {
-		return fmt.Errorf("Formula 不存在: %s（使用 `hoc formula list` 查看可用列表）", name)
+		return fmt.Errorf("formula 不存在: %s（使用 `hoc formula list` 查看可用列表）", name)
 	}
 
 	// Parse --var key=value flags.
@@ -137,7 +137,7 @@ func runFormulaStatus(_ *cobra.Command, args []string) error {
 
 	f := reg.Get(name)
 	if f == nil {
-		return fmt.Errorf("Formula 不存在: %s", name)
+		return fmt.Errorf("formula 不存在: %s", name)
 	}
 
 	kind := "用户自定义"

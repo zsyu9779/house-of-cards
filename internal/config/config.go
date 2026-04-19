@@ -229,7 +229,7 @@ func NewConfigWatcher(configPath string, onChange func(*HotReloadableParams)) (*
 	// Watch the config file's directory.
 	dir := filepath.Dir(configPath)
 	if err := watcher.Add(dir); err != nil {
-		watcher.Close()
+		_ = watcher.Close()
 		return nil, err
 	}
 
@@ -285,7 +285,7 @@ func (cw *ConfigWatcher) reload() {
 // Stop stops the config watcher.
 func (cw *ConfigWatcher) Stop() {
 	close(cw.stopCh)
-	cw.watcher.Close()
+	_ = cw.watcher.Close()
 }
 
 func DefaultConfig(homeDir string) *Config {
@@ -364,7 +364,7 @@ func SaveConfig(path string, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("create config file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fmt.Fprintln(f, "# House of Cards 配置文件")
 	return toml.NewEncoder(f).Encode(cfg)

@@ -65,7 +65,7 @@ var initCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("init database: %w", err)
 		}
-		database.Close()
+		_ = database.Close() //nolint:errcheck
 		fmt.Printf("  创建数据库: %s\n", filepath.Join(workspace, ".hoc", "state.db"))
 
 		fmt.Printf("\n✅ House of Cards 工作区初始化完成!\n")
