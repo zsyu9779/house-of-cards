@@ -41,6 +41,16 @@ type DoneFilePayload struct {
 	Assumptions map[string]string `toml:"assumptions"`
 }
 
+// ContextHealth reports the minister's AI runtime context consumption.
+// Transported inside the Gazette payload JSON under the "context_health" key,
+// allowing the Whip to proactively intervene before the minister's context
+// window exhausts. See tech-spec-context-health.md for the protocol.
+type ContextHealth struct {
+	TokensUsed   int `json:"tokens_used"`
+	TokensLimit  int `json:"tokens_limit"`
+	TurnsElapsed int `json:"turns_elapsed"`
+}
+
 // QuestionRoundLimit is the maximum number of question-answer rounds allowed.
 const QuestionRoundLimit = 3
 

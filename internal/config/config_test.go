@@ -271,6 +271,11 @@ func TestConfig_Validate(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			name:    "otlp exporter is stub",
+			modify:  func(c *config.Config) { c.Observability.Exporter = "otlp" },
+			wantErr: "stub",
+		},
+		{
 			name:    "home directory does not exist",
 			modify:  func(c *config.Config) { c.Home = "/nonexistent/path/xyz" },
 			wantErr: "home directory",

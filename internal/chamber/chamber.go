@@ -3,6 +3,7 @@ package chamber
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,8 +56,10 @@ func (c *Chamber) Create() error {
 
 // Remove removes the worktree.
 func (c *Chamber) Remove() error {
-	// Remove worktree
+	// Remove worktree. Run from MainRepo so git resolves the worktree against
+	// the correct repository regardless of the caller's cwd.
 	cmd := exec.Command("git", "worktree", "remove", "--force", c.Path)
+	cmd.Dir = c.MainRepo
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("remove worktree: %w, output: %s", err, string(output))
 	}
@@ -66,7 +69,7 @@ func (c *Chamber) Remove() error {
 	cmd.Dir = c.MainRepo
 	if output, err := cmd.CombinedOutput(); err != nil {
 		// Non-fatal - branch might not exist
-		fmt.Printf("warning: could not delete branch: %s\n", string(output))
+		slog.Warn("could not delete branch", "branch", c.Branch, "output", strings.TrimSpace(string(output)), "err", err)
 	}
 
 	return nil

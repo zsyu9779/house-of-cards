@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,11 +84,17 @@ func (c *Config) Validate() error {
 	}
 
 	// --- Observability ---
+	// otlp is accepted at parse time but flagged as a stub: spans would be
+	// dropped silently, so we reject it at validation with a clear error.
 	validExporters := map[string]bool{"stdout": true, "otlp": true, "nop": true}
 	if c.Observability.Exporter != "" && !validExporters[c.Observability.Exporter] {
 		errs = append(errs, fmt.Sprintf(
 			"observability.exporter: %q is not valid (choose: stdout, otlp, nop)",
 			c.Observability.Exporter))
+	}
+	if c.Observability.Exporter == "otlp" {
+		errs = append(errs, "observability.exporter: \"otlp\" is a stub and not yet supported "+
+			"(spans would be dropped silently) — use \"stdout\" or \"nop\"")
 	}
 
 	// --- Home directory ---
@@ -105,6 +112,18 @@ func (c *Config) Validate() error {
 			c.Doctor.DBSizeWarnMB))
 	}
 
+	// --- Log ---
+	validLevels := map[string]bool{"": true, "debug": true, "info": true, "warn": true, "error": true}
+	if !validLevels[strings.ToLower(c.Log.Level)] {
+		errs = append(errs, fmt.Sprintf(
+			"log.level: %q is not valid (choose: debug, info, warn, error)", c.Log.Level))
+	}
+	validFormats := map[string]bool{"": true, "text": true, "json": true}
+	if !validFormats[strings.ToLower(c.Log.Format)] {
+		errs = append(errs, fmt.Sprintf(
+			"log.format: %q is not valid (choose: text, json)", c.Log.Format))
+	}
+
 	if len(errs) > 0 {
 		return &ValidationError{Errors: errs}
 	}
@@ -120,6 +139,15 @@ type Config struct {
 	Defaults      DefaultsConfig      `toml:"defaults"`
 	Observability ObservabilityConfig `toml:"observability"`
 	Doctor        DoctorConfig        `toml:"doctor"`
+	Log           LogConfig           `toml:"log"`
+}
+
+// LogConfig controls the global slog handler.
+type LogConfig struct {
+	// Level: debug | info | warn | error
+	Level string `toml:"level"`
+	// Format: text | json
+	Format string `toml:"format"`
 }
 
 // DoctorConfig controls doctor check thresholds.
@@ -130,9 +158,11 @@ type DoctorConfig struct {
 
 // ObservabilityConfig controls the OpenTelemetry-compatible observability layer.
 type ObservabilityConfig struct {
-	// Exporter selects the export backend: "stdout" | "otlp" | "nop"
+	// Exporter selects the export backend: "stdout" | "otlp" | "nop".
+	// NOTE: "otlp" is a stub in v0.3 and rejected by Validate; use "stdout" or "nop".
 	Exporter string `toml:"exporter"`
 	// OTLPEndpoint is the gRPC/HTTP endpoint for OTLP export.
+	// NOTE: OTLP export is not yet implemented in v0.3.
 	OTLPEndpoint string `toml:"otlp_endpoint"`
 	// ServiceName is the logical service name in traces/metrics.
 	ServiceName string `toml:"service_name"`
@@ -225,7 +255,7 @@ func (cw *ConfigWatcher) Start() {
 				if !ok {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "config watcher error: %v\n", err)
+				slog.Error("config watcher error", "err", err)
 			}
 		}
 	}()
@@ -235,7 +265,7 @@ func (cw *ConfigWatcher) Start() {
 func (cw *ConfigWatcher) reload() {
 	cfg, err := LoadConfig(filepath.Dir(filepath.Dir(cw.configPath)))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to reload config: %v\n", err)
+		slog.Error("config reload failed", "err", err, "path", cw.configPath)
 		return
 	}
 
@@ -291,6 +321,10 @@ func DefaultConfig(homeDir string) *Config {
 		Doctor: DoctorConfig{
 			DBSizeWarnMB:       100,
 			GazetteBacklogWarn: 50,
+		},
+		Log: LogConfig{
+			Level:  "info",
+			Format: "text",
 		},
 	}
 }

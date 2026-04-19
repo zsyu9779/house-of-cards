@@ -391,6 +391,228 @@ func TestScaleThresholds(t *testing.T) {
 	})
 }
 
+// ─── autoscale pure-function tests ──────────────────────────────────────────
+
+func TestShouldScaleUp(t *testing.T) {
+	tests := []struct {
+		name                       string
+		pending, idle, threshold   int
+		want                       bool
+	}{
+		{"no pending", 0, 0, 2, false},
+		{"under threshold", 2, 1, 2, false},                // 2 > 1*2? no, 2 > 2 = false
+		{"exactly threshold", 4, 2, 2, false},              // 4 > 4 = false
+		{"just over threshold", 5, 2, 2, true},             // 5 > 4
+		{"zero idle with pending", 1, 0, 2, true},          // 1 > 0
+		{"large backlog", 10, 1, 2, true},                  // 10 > 2
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldScaleUp(tt.pending, tt.idle, tt.threshold); got != tt.want {
+				t.Errorf("shouldScaleUp(%d, %d, %d) = %v, want %v",
+					tt.pending, tt.idle, tt.threshold, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldScaleDown(t *testing.T) {
+	tests := []struct {
+		name                     string
+		pending, idle, threshold int
+		want                     bool
+	}{
+		{"balanced", 1, 1, 2, false},
+		{"idle equal to threshold", 0, 2, 2, false},   // floor: never drain to 0
+		{"idle over threshold no pending", 0, 3, 2, true},
+		{"excess idle with pending", 1, 4, 2, true},   // 4 > 1+2 && 4 > 2
+		{"pending absorbs slack", 3, 4, 2, false},     // 4 > 3+2? no
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldScaleDown(tt.pending, tt.idle, tt.threshold); got != tt.want {
+				t.Errorf("shouldScaleDown(%d, %d, %d) = %v, want %v",
+					tt.pending, tt.idle, tt.threshold, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestListPendingBills(t *testing.T) {
+	bills := []*store.Bill{
+		{ID: "a", Status: "draft"},
+		{ID: "b", Status: "reading"},
+		{ID: "c", Status: "reading", Assignee: store.NullString("m1")}, // assigned → excluded
+		{ID: "d", Status: "enacted"},                                   // done → excluded
+		{ID: "e", Status: "draft"},
+	}
+	pending := listPendingBills(bills)
+	if len(pending) != 3 {
+		t.Fatalf("want 3 pending, got %d", len(pending))
+	}
+	ids := []string{pending[0].ID, pending[1].ID, pending[2].ID}
+	want := []string{"a", "b", "e"}
+	for i, id := range want {
+		if ids[i] != id {
+			t.Errorf("pending[%d]: got %q, want %q", i, ids[i], id)
+		}
+	}
+}
+
+func TestMatchBillToMinister_SkillMatch(t *testing.T) {
+	bills := []*store.Bill{
+		{ID: "backend-bill", Portfolio: store.NullString("backend")},
+		{ID: "frontend-bill", Portfolio: store.NullString("frontend")},
+	}
+	ministers := []*store.Minister{
+		{ID: "m-fe", Skills: `["frontend"]`},
+		{ID: "m-be", Skills: `["backend","go"]`},
+	}
+	// First bill (backend) should match m-be even though m-fe comes first.
+	bill, m := matchBillToMinister(bills, ministers)
+	if bill == nil || bill.ID != "backend-bill" {
+		t.Errorf("bill: got %+v, want backend-bill", bill)
+	}
+	if m == nil || m.ID != "m-be" {
+		t.Errorf("minister: got %+v, want m-be", m)
+	}
+}
+
+func TestMatchBillToMinister_EmptyPortfolioMatchesAny(t *testing.T) {
+	bills := []*store.Bill{{ID: "any", Portfolio: store.NullString("")}}
+	ministers := []*store.Minister{{ID: "first", Skills: `["frontend"]`}}
+	_, m := matchBillToMinister(bills, ministers)
+	if m == nil || m.ID != "first" {
+		t.Errorf("empty portfolio should match first minister, got %+v", m)
+	}
+}
+
+func TestMatchBillToMinister_NoMatch(t *testing.T) {
+	bills := []*store.Bill{{ID: "be", Portfolio: store.NullString("backend")}}
+	ministers := []*store.Minister{{ID: "m-fe", Skills: `["frontend"]`}}
+	bill, m := matchBillToMinister(bills, ministers)
+	if bill != nil || m != nil {
+		t.Errorf("no match expected, got bill=%+v minister=%+v", bill, m)
+	}
+}
+
+func TestHasSkill(t *testing.T) {
+	tests := []struct {
+		name      string
+		skills    string
+		portfolio string
+		want      bool
+	}{
+		{"empty portfolio always matches", `["go"]`, "", true},
+		{"empty skills no match", "", "go", false},
+		{"direct match", `["go","sql"]`, "go", true},
+		{"case-insensitive", `["Go"]`, "go", true},
+		{"no match", `["rust"]`, "go", false},
+		{"invalid json falls back to substring", `go,sql`, "go", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasSkill(tt.skills, tt.portfolio); got != tt.want {
+				t.Errorf("hasSkill(%q, %q) = %v, want %v", tt.skills, tt.portfolio, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAutoscale_MaxPerTick verifies that a single tick only activates at most
+// maxScaleUpPerTick ministers even when the backlog and reserve pool are huge.
+func TestAutoscale_MaxPerTick(t *testing.T) {
+	w, db := newTestWhip(t)
+	mustCreateSession(t, db, "sess-cap", "Cap Session")
+
+	// Create a large backlog (10 pending bills) with no portfolio.
+	for i := 0; i < 10; i++ {
+		mustCreateBill(t, db, fmt.Sprintf("bill-cap-%d", i), "sess-cap", "Cap Bill", "draft", "")
+	}
+
+	// Create 5 offline reserve ministers.
+	for i := 0; i < 5; i++ {
+		m := &store.Minister{
+			ID:      fmt.Sprintf("m-cap-%d", i),
+			Title:   "Cap",
+			Runtime: "claude-code",
+			Skills:  `["backend"]`,
+			Status:  "offline",
+		}
+		if err := db.CreateMinister(m); err != nil {
+			t.Fatalf("CreateMinister: %v", err)
+		}
+	}
+
+	w.autoscale()
+
+	// With no project attached to the session, summonReserve falls back to the
+	// offline→idle activation path — but it is still capped at maxScaleUpPerTick.
+	activated := 0
+	ms, _ := db.ListMinisters()
+	for _, m := range ms {
+		if m.Status == "idle" {
+			activated++
+		}
+	}
+	if activated != maxScaleUpPerTick {
+		t.Errorf("activated ministers: got %d, want %d (maxScaleUpPerTick)", activated, maxScaleUpPerTick)
+	}
+}
+
+// TestAutoscale_RespectsMaxMinisters verifies the MaxMinisters cap blocks further
+// scale-up once the active count already hits the configured ceiling.
+func TestAutoscale_RespectsMaxMinisters(t *testing.T) {
+	w, db := newTestWhip(t)
+	w.cfg = &config.Config{}
+	w.cfg.Whip.MaxMinisters = 2 // Only 2 total active ministers allowed.
+
+	mustCreateSession(t, db, "sess-max", "Max Session")
+	for i := 0; i < 6; i++ {
+		mustCreateBill(t, db, fmt.Sprintf("bill-max-%d", i), "sess-max", "Max Bill", "draft", "")
+	}
+
+	// 2 working ministers already — at the cap.
+	for i := 0; i < 2; i++ {
+		m := &store.Minister{
+			ID:      fmt.Sprintf("m-working-%d", i),
+			Title:   "W",
+			Runtime: "claude-code",
+			Skills:  `["backend"]`,
+			Status:  "working",
+		}
+		if err := db.CreateMinister(m); err != nil {
+			t.Fatalf("CreateMinister: %v", err)
+		}
+	}
+	// 3 reserve ministers available, but cap should stop activation.
+	for i := 0; i < 3; i++ {
+		m := &store.Minister{
+			ID:      fmt.Sprintf("m-reserve-%d", i),
+			Title:   "R",
+			Runtime: "claude-code",
+			Skills:  `["backend"]`,
+			Status:  "offline",
+		}
+		if err := db.CreateMinister(m); err != nil {
+			t.Fatalf("CreateMinister: %v", err)
+		}
+	}
+
+	w.autoscale()
+
+	ms, _ := db.ListMinisters()
+	active := 0
+	for _, m := range ms {
+		if m.Status == "working" || m.Status == "idle" {
+			active++
+		}
+	}
+	if active > 2 {
+		t.Errorf("active ministers exceeded MaxMinisters cap: got %d, want ≤2", active)
+	}
+}
+
 // ─── orderPaper tests ───────────────────────────────────────────────────────
 
 func TestOrderPaper_DelegatesToAdvance(t *testing.T) {

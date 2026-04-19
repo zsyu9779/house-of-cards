@@ -1,7 +1,10 @@
 package store_test
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/house-of-cards/hoc/internal/store"
@@ -805,6 +808,341 @@ func TestRecordEventPayload(t *testing.T) {
 	}
 	if events[0].Source != "test" {
 		t.Errorf("source: got %q, want %q", events[0].Source, "test")
+	}
+}
+
+// ─── B-2: Concurrency tests ───────────────────────────────────────────────────
+
+// TestConcurrentCreateBill spins up N goroutines each creating a unique bill.
+// SQLite WAL mode serializes writes; all creates must succeed without races
+// or primary-key conflicts when IDs are distinct.
+func TestConcurrentCreateBill_DistinctIDs(t *testing.T) {
+	db := newTestDB(t)
+
+	const n = 10
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			b := &store.Bill{
+				ID:     fmt.Sprintf("bill-%d", i),
+				Title:  fmt.Sprintf("Concurrent bill %d", i),
+				Status: "draft",
+			}
+			errs[i] = db.CreateBill(b)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: CreateBill failed: %v", i, err)
+		}
+	}
+
+	bills, err := db.ListBills()
+	if err != nil {
+		t.Fatalf("ListBills: %v", err)
+	}
+	if len(bills) != n {
+		t.Errorf("expected %d bills, got %d", n, len(bills))
+	}
+}
+
+// TestConcurrentUpdateMinisterHeartbeat verifies that multiple goroutines
+// updating the same minister's heartbeat produce a consistent terminal state
+// (no corruption, no race).
+func TestConcurrentUpdateMinisterHeartbeat(t *testing.T) {
+	db := newTestDB(t)
+
+	m := &store.Minister{
+		ID:      "concurrent-m",
+		Title:   "Concurrent Minister",
+		Runtime: "claude-code",
+		Skills:  `["go"]`,
+		Status:  "working",
+	}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("CreateMinister: %v", err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := db.UpdateMinisterHeartbeat(m.ID); err != nil {
+				t.Errorf("UpdateMinisterHeartbeat: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := db.GetMinister(m.ID)
+	if err != nil {
+		t.Fatalf("GetMinister: %v", err)
+	}
+	if !got.Heartbeat.Valid {
+		t.Errorf("heartbeat should be set after concurrent updates")
+	}
+}
+
+// TestConcurrentRecordEvent appends events from many goroutines and verifies
+// that no events are lost.
+func TestConcurrentRecordEvent(t *testing.T) {
+	db := newTestDB(t)
+
+	const n = 30
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := db.RecordEvent("concurrent.event", "test", "", "", "",
+				fmt.Sprintf(`{"i":%d}`, i)); err != nil {
+				t.Errorf("RecordEvent %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	events, err := db.ListEvents("concurrent.event", "", "", 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != n {
+		t.Errorf("expected %d events, got %d", n, len(events))
+	}
+}
+
+// TestConcurrentIncrementRecoveryAttempts verifies the atomic counter behaves
+// correctly under concurrent increments (each increment is a single UPDATE
+// inside SQLite's write lock, so the final count must equal n).
+func TestConcurrentIncrementRecoveryAttempts(t *testing.T) {
+	db := newTestDB(t)
+
+	m := &store.Minister{
+		ID: "recover-m", Title: "R", Runtime: "claude-code",
+		Skills: `["go"]`, Status: "stuck",
+	}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("CreateMinister: %v", err)
+	}
+
+	const n = 15
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := db.IncrementRecoveryAttempts(m.ID); err != nil {
+				t.Errorf("IncrementRecoveryAttempts: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := db.GetMinister(m.ID)
+	if err != nil {
+		t.Fatalf("GetMinister: %v", err)
+	}
+	if got.RecoveryAttempts != n {
+		t.Errorf("RecoveryAttempts: got %d, want %d", got.RecoveryAttempts, n)
+	}
+}
+
+// ─── B-2: Error-path tests ────────────────────────────────────────────────────
+
+func TestGetMinister_NotFound(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.GetMinister("nonexistent")
+	if err == nil {
+		t.Fatal("expected error for missing minister")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestGetBill_NotFound(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.GetBill("nonexistent")
+	if err == nil {
+		t.Fatal("expected error for missing bill")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestGetSession_NotFound(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.GetSession("nope")
+	if err == nil {
+		t.Fatal("expected error for missing session")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestCreateMinister_DuplicateID(t *testing.T) {
+	db := newTestDB(t)
+
+	m := &store.Minister{
+		ID: "dup-m", Title: "Dup", Runtime: "claude-code",
+		Skills: `["go"]`, Status: "offline",
+	}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("first CreateMinister: %v", err)
+	}
+	if err := db.CreateMinister(m); err == nil {
+		t.Fatal("expected error on duplicate minister ID")
+	}
+}
+
+func TestCreateBill_DuplicateID(t *testing.T) {
+	db := newTestDB(t)
+
+	b := &store.Bill{ID: "dup-b", Title: "Dup", Status: "draft"}
+	if err := db.CreateBill(b); err != nil {
+		t.Fatalf("first CreateBill: %v", err)
+	}
+	if err := db.CreateBill(b); err == nil {
+		t.Fatal("expected error on duplicate bill ID")
+	}
+}
+
+func TestCreateSession_DuplicateID(t *testing.T) {
+	db := newTestDB(t)
+
+	s := &store.Session{ID: "dup-s", Title: "Dup", Topology: "chain", Status: "active"}
+	if err := db.CreateSession(s); err != nil {
+		t.Fatalf("first CreateSession: %v", err)
+	}
+	if err := db.CreateSession(s); err == nil {
+		t.Fatal("expected error on duplicate session ID")
+	}
+}
+
+func TestPushHook_MissingMinister(t *testing.T) {
+	db := newTestDB(t)
+	err := db.PushHook("nonexistent", "bill-1")
+	if err == nil {
+		t.Fatal("expected error pushing to missing minister")
+	}
+}
+
+func TestPopHook_MissingMinister(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.PopHook("nonexistent")
+	if err == nil {
+		t.Fatal("expected error popping from missing minister")
+	}
+}
+
+func TestPeekHook_MissingMinister(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.PeekHook("nonexistent")
+	if err == nil {
+		t.Fatal("expected error peeking missing minister")
+	}
+}
+
+func TestPopHook_EmptyQueue(t *testing.T) {
+	db := newTestDB(t)
+
+	m := &store.Minister{ID: "empty-m", Title: "E", Runtime: "claude-code", Skills: `[]`, Status: "idle"}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("CreateMinister: %v", err)
+	}
+
+	got, err := db.PopHook(m.ID)
+	if err != nil {
+		t.Fatalf("PopHook empty: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected empty bill ID, got %q", got)
+	}
+}
+
+// TestUpdateBillStatus_UnknownID exercises the UPDATE path on a missing row.
+// SQLite's UPDATE affecting 0 rows is not an error — the function must return
+// nil to preserve idempotent semantics used by Whip retries.
+func TestUpdateBillStatus_UnknownID(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.UpdateBillStatus("ghost-bill", "enacted"); err != nil {
+		t.Errorf("expected no error for unknown bill ID, got %v", err)
+	}
+}
+
+// TestUpdateMinisterStatus_UnknownID mirrors the above for ministers.
+func TestUpdateMinisterStatus_UnknownID(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.UpdateMinisterStatus("ghost-m", "idle"); err != nil {
+		t.Errorf("expected no error for unknown minister ID, got %v", err)
+	}
+}
+
+// TestCreateGazette_EmptyPayload verifies that a gazette with no payload
+// content is stored without panicking or producing NULL-scan errors on readback.
+func TestCreateGazette_EmptyPayload(t *testing.T) {
+	db := newTestDB(t)
+
+	g := &store.Gazette{
+		ID:      "gaz-empty-1",
+		Summary: "No payload",
+	}
+	if err := db.CreateGazette(g); err != nil {
+		t.Fatalf("CreateGazette: %v", err)
+	}
+
+	gazettes, err := db.ListGazettes()
+	if err != nil {
+		t.Fatalf("ListGazettes: %v", err)
+	}
+	if len(gazettes) != 1 {
+		t.Fatalf("expected 1 gazette, got %d", len(gazettes))
+	}
+	if gazettes[0].Payload != "" {
+		t.Errorf("expected empty payload, got %q", gazettes[0].Payload)
+	}
+}
+
+// TestDeleteMinister_Idempotent verifies deleting a missing minister is a no-op.
+func TestDeleteMinister_Idempotent(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.DeleteMinister("ghost"); err != nil {
+		t.Errorf("expected no error deleting missing minister, got %v", err)
+	}
+}
+
+// TestResetRecoveryAttempts_Flow verifies increment → reset cycle.
+func TestResetRecoveryAttempts_Flow(t *testing.T) {
+	db := newTestDB(t)
+
+	m := &store.Minister{ID: "flow-m", Title: "F", Runtime: "claude-code", Skills: `[]`, Status: "stuck"}
+	if err := db.CreateMinister(m); err != nil {
+		t.Fatalf("CreateMinister: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := db.IncrementRecoveryAttempts(m.ID); err != nil {
+			t.Fatalf("Increment: %v", err)
+		}
+	}
+	if err := db.ResetRecoveryAttempts(m.ID); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	got, err := db.GetMinister(m.ID)
+	if err != nil {
+		t.Fatalf("GetMinister: %v", err)
+	}
+	if got.RecoveryAttempts != 0 {
+		t.Errorf("RecoveryAttempts after reset: got %d, want 0", got.RecoveryAttempts)
 	}
 }
 

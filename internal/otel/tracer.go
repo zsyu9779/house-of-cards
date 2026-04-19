@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -252,14 +253,18 @@ func (e *StdoutExporter) ExportSpan(span *Span) {
 
 // ── otlp stub exporter ──
 
-// OTLPExporter is a placeholder for future gRPC/HTTP OTLP export.
-// Currently it logs to stderr and does nothing else.
+// OTLPExporter is a stub — OTLP export is not yet implemented in v0.3.
+// Construction emits a one-time slog.Warn so spans are not dropped silently.
+// See docs/v0.3/v0.3-draft.md §E-3.
 type OTLPExporter struct {
 	endpoint string
 }
 
-// NewOTLPExporter creates an OTLP exporter stub.
+// NewOTLPExporter creates an OTLP exporter stub. It logs a stub warning so
+// operators realise spans will not be delivered.
 func NewOTLPExporter(endpoint string) *OTLPExporter {
+	slog.Warn("otlp exporter is a stub — spans will be dropped (v0.3 unsupported)",
+		"endpoint", endpoint)
 	return &OTLPExporter{endpoint: endpoint}
 }
 

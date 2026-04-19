@@ -3,9 +3,12 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,12 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// isDuplicateColumnErr reports whether err is SQLite's "duplicate column" error,
+// returned by ALTER TABLE ADD COLUMN when the column already exists.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column")
+}
 
 type DB struct {
 	conn *sql.DB
@@ -26,7 +35,11 @@ func NewDB(homeDir string) (*DB, error) {
 	}
 
 	dbPath := filepath.Join(stateDir, "state.db")
-	conn, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL")
+	// _pragma=busy_timeout(5000) lets SQLite wait up to 5s on write-lock contention
+	// instead of returning SQLITE_BUSY immediately — required for correct behaviour
+	// under concurrent writers (Whip tick + CLI commands + API handlers share the DB).
+	conn, err := sql.Open("sqlite",
+		dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -112,28 +125,38 @@ func (db *DB) migrate() error {
 	if _, err := db.conn.Exec(schema); err != nil {
 		return err
 	}
-	// Idempotent migrations for columns added after initial schema.
-	_, _ = db.conn.Exec(`ALTER TABLE bills ADD COLUMN portfolio TEXT DEFAULT ''`)
-	_, _ = db.conn.Exec(`ALTER TABLE sessions ADD COLUMN project TEXT DEFAULT ''`)
-	// Phase 10: multi-project support.
-	_, _ = db.conn.Exec(`ALTER TABLE bills ADD COLUMN project TEXT DEFAULT ''`)
-	_, _ = db.conn.Exec(`ALTER TABLE sessions ADD COLUMN projects TEXT DEFAULT '[]'`)
-	// Phase 3B: Minister hook queue (JSON array of bill IDs).
-	_, _ = db.conn.Exec(`ALTER TABLE ministers ADD COLUMN hook TEXT DEFAULT '[]'`)
-	// Phase 2: Gazette ACK protocol + structured payload.
-	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN ack_status TEXT DEFAULT ''`)
-	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN thread_id TEXT DEFAULT ''`)
-	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN reply_to TEXT DEFAULT ''`)
-	_, _ = db.conn.Exec(`ALTER TABLE gazettes ADD COLUMN payload TEXT DEFAULT ''`)
-	// Phase 2: Session ACK mode.
-	_, _ = db.conn.Exec(`ALTER TABLE sessions ADD COLUMN ack_mode TEXT DEFAULT 'auto'`)
-	// Phase 3: B-3 Bill split — parent bill reference.
-	_, _ = db.conn.Exec(`ALTER TABLE bills ADD COLUMN parent_bill TEXT DEFAULT ''`)
-	// Phase 4: B-1.4 Question Time metrics on hansard.
-	_, _ = db.conn.Exec(`ALTER TABLE hansard ADD COLUMN ack_rounds INTEGER DEFAULT 0`)
-	_, _ = db.conn.Exec(`ALTER TABLE hansard ADD COLUMN briefing_time_s INTEGER DEFAULT 0`)
-	// v0.3: Whip graduated recovery.
-	_, _ = db.conn.Exec(`ALTER TABLE ministers ADD COLUMN recovery_attempts INTEGER DEFAULT 0`)
+	// Idempotent column migrations. Each ALTER is best-effort: SQLite returns
+	// "duplicate column" when the column already exists, which is the normal
+	// case on every boot after the first. Other errors are logged for visibility
+	// but not fatal, since migrate() must stay runnable across upgrade paths.
+	migrations := []string{
+		`ALTER TABLE bills ADD COLUMN portfolio TEXT DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN project TEXT DEFAULT ''`,
+		// Phase 10: multi-project support.
+		`ALTER TABLE bills ADD COLUMN project TEXT DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN projects TEXT DEFAULT '[]'`,
+		// Phase 3B: Minister hook queue (JSON array of bill IDs).
+		`ALTER TABLE ministers ADD COLUMN hook TEXT DEFAULT '[]'`,
+		// Phase 2: Gazette ACK protocol + structured payload.
+		`ALTER TABLE gazettes ADD COLUMN ack_status TEXT DEFAULT ''`,
+		`ALTER TABLE gazettes ADD COLUMN thread_id TEXT DEFAULT ''`,
+		`ALTER TABLE gazettes ADD COLUMN reply_to TEXT DEFAULT ''`,
+		`ALTER TABLE gazettes ADD COLUMN payload TEXT DEFAULT ''`,
+		// Phase 2: Session ACK mode.
+		`ALTER TABLE sessions ADD COLUMN ack_mode TEXT DEFAULT 'auto'`,
+		// Phase 3: B-3 Bill split — parent bill reference.
+		`ALTER TABLE bills ADD COLUMN parent_bill TEXT DEFAULT ''`,
+		// Phase 4: B-1.4 Question Time metrics on hansard.
+		`ALTER TABLE hansard ADD COLUMN ack_rounds INTEGER DEFAULT 0`,
+		`ALTER TABLE hansard ADD COLUMN briefing_time_s INTEGER DEFAULT 0`,
+		// v0.3: Whip graduated recovery.
+		`ALTER TABLE ministers ADD COLUMN recovery_attempts INTEGER DEFAULT 0`,
+	}
+	for _, stmt := range migrations {
+		if _, err := db.conn.Exec(stmt); err != nil && !isDuplicateColumnErr(err) {
+			slog.Warn("migrate: ALTER TABLE failed", "stmt", stmt, "err", err)
+		}
+	}
 
 	// Indexes for common query patterns.
 	indexes := []string{
@@ -515,6 +538,37 @@ func (db *DB) CreateGazette(g *Gazette) error {
 		g.ID, g.FromMinister, g.ToMinister, g.BillID, g.Type, g.Summary, g.Artifacts, g.AckStatus, g.ThreadID, g.ReplyTo, g.Payload,
 	)
 	return err
+}
+
+// GetLatestContextHealth returns the most recent ContextHealth payload reported
+// by the given minister. Returns (nil, nil) when the minister has not yet sent
+// any gazette carrying a context_health payload — callers should treat that as
+// "no data, skip" rather than an error.
+func (db *DB) GetLatestContextHealth(ministerID string) (*ContextHealth, error) {
+	var payload string
+	err := db.conn.QueryRow(
+		`SELECT COALESCE(payload,'') FROM gazettes
+		 WHERE from_minister = ? AND payload LIKE '%context_health%'
+		 ORDER BY created_at DESC LIMIT 1`,
+		ministerID,
+	).Scan(&payload)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if payload == "" {
+		return nil, nil
+	}
+
+	var wrapper struct {
+		ContextHealth *ContextHealth `json:"context_health"`
+	}
+	if err := json.Unmarshal([]byte(payload), &wrapper); err != nil {
+		return nil, fmt.Errorf("parse context_health payload: %w", err)
+	}
+	return wrapper.ContextHealth, nil
 }
 
 func (db *DB) ListGazettesForMinister(ministerID string) ([]*Gazette, error) {
@@ -928,16 +982,19 @@ func (db *DB) GetWhipStats() (*WhipStats, error) {
 	stats := &WhipStats{}
 
 	// Count by-elections: Hansard entries written by the Whip (補選触発).
-	row := db.conn.QueryRow(
+	// Scan failures default to 0, which is the correct zero-value signal.
+	if err := db.conn.QueryRow(
 		`SELECT COUNT(*) FROM hansard WHERE notes LIKE '%补选触发%'`,
-	)
-	_ = row.Scan(&stats.ByElectionCount)
+	).Scan(&stats.ByElectionCount); err != nil {
+		slog.Warn("GetWhipStats: by-election count scan", "err", err)
+	}
 
 	// Average completion time across enacted bills with measured duration.
-	row = db.conn.QueryRow(
+	if err := db.conn.QueryRow(
 		`SELECT COALESCE(AVG(duration_s), 0) FROM hansard WHERE outcome = 'enacted' AND duration_s > 0`,
-	)
-	_ = row.Scan(&stats.AvgDurationS)
+	).Scan(&stats.AvgDurationS); err != nil {
+		slog.Warn("GetWhipStats: avg duration scan", "err", err)
+	}
 
 	// Ministers currently stuck.
 	stuck, err := db.ListMinistersWithStatus("stuck")
@@ -1495,12 +1552,20 @@ type Event struct {
 
 // RecordEvent writes a structured event to the events table.
 func (db *DB) RecordEvent(topic, source, billID, ministerID, sessionID, payload string) error {
-	id := fmt.Sprintf("evt-%x", time.Now().UnixNano())
+	id := newEventID()
 	_, err := db.conn.Exec(
 		`INSERT INTO events (id, topic, bill_id, minister_id, session_id, source, payload) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id, topic, NullString(billID), NullString(ministerID), NullString(sessionID), source, payload,
 	)
 	return err
+}
+
+// newEventID returns a unique event ID combining nanosecond timestamp with random
+// bytes — nanosecond precision alone collides under concurrent callers.
+func newEventID() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("evt-%x-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
 }
 
 // ListEvents returns events matching optional filters, newest first.

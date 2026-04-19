@@ -6,9 +6,16 @@ import (
 	"log/slog"
 	"strings"
 
+	ministerpkg "github.com/house-of-cards/hoc/internal/minister"
 	"github.com/house-of-cards/hoc/internal/privy"
 	"github.com/house-of-cards/hoc/internal/store"
 )
+
+// maxScaleUpPerTick caps how many ministers autoscale can summon in a single
+// tick. It exists to smooth bursts: even when the pending backlog is huge we
+// want to observe at least one tick cycle between successive summons so the
+// next tick can incorporate fresh assignments (and respect MaxMinisters).
+const maxScaleUpPerTick = 2
 
 // ─── Order Paper (DAG Engine) ────────────────────────────────────────────────
 
@@ -381,101 +388,285 @@ func (w *Whip) epicIsComplete(epicID string) bool {
 
 // ─── Autoscale ───────────────────────────────────────────────────────────────
 
+// shouldScaleUp returns true when the pending backlog outgrows the idle pool by
+// the configured threshold. Requires at least one pending bill so we never scale
+// up into an empty queue.
+func shouldScaleUp(pendingBills, idleMinisters, threshold int) bool {
+	return pendingBills > 0 && pendingBills > idleMinisters*threshold
+}
+
+// shouldScaleDown returns true when the idle pool is larger than the pending
+// backlog by more than the threshold, and the pool itself exceeds the threshold
+// (so we never drain below that floor).
+func shouldScaleDown(pendingBills, idleMinisters, threshold int) bool {
+	return idleMinisters > pendingBills+threshold && idleMinisters > threshold
+}
+
+// listPendingBills returns the subset of bills that are unassigned and in a
+// pre-work status (draft or reading). Pure function, safe to unit test.
+func listPendingBills(all []*store.Bill) []*store.Bill {
+	out := make([]*store.Bill, 0, len(all))
+	for _, b := range all {
+		if (b.Status == "draft" || b.Status == "reading") && b.Assignee.String == "" {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// matchBillToMinister picks the first (bill, minister) pair whose skills match.
+// A bill with an empty portfolio matches any minister. Walk order follows the
+// input slices, so callers express preference by pre-sorting.
+func matchBillToMinister(bills []*store.Bill, ministers []*store.Minister) (*store.Bill, *store.Minister) {
+	for _, b := range bills {
+		portfolio := b.Portfolio.String
+		for _, m := range ministers {
+			if portfolio == "" || hasSkill(m.Skills, portfolio) {
+				return b, m
+			}
+		}
+	}
+	return nil, nil
+}
+
+// hasSkill reports whether the minister's skills JSON array contains the given
+// portfolio (case-insensitive). Falls back to substring match when the skills
+// field is not valid JSON.
+func hasSkill(skillsJSON, portfolio string) bool {
+	if portfolio == "" {
+		return true
+	}
+	if skillsJSON == "" {
+		return false
+	}
+	var skills []string
+	if err := json.Unmarshal([]byte(skillsJSON), &skills); err != nil {
+		return strings.Contains(skillsJSON, portfolio)
+	}
+	for _, s := range skills {
+		if strings.EqualFold(s, portfolio) {
+			return true
+		}
+	}
+	return false
+}
+
 // autoscale dynamically adjusts the number of active Ministers based on workload.
 //
-// Scale-up: when pending bills > idle ministers * scaleUpThreshold,
-// activate ministers from the reserve pool (offline with skills).
+// Scale-up: when pending bills > idle ministers * scaleUpThreshold, summon
+// ministers from the reserve pool (offline with skills) and seat them in a
+// chamber for a matching pending bill. At most maxScaleUpPerTick summons per
+// tick, never exceeding cfg.Whip.MaxMinisters in total active ministers.
 //
-// Scale-down: when idle ministers > pending bills + scaleDownThreshold,
-// mark excess idle ministers as offline.
-//
-// Thresholds are configurable via config.toml (whip.scale_up_threshold / scale_down_threshold).
+// Scale-down: when idle ministers > pending bills + scaleDownThreshold, mark
+// excess idle ministers as offline.
 func (w *Whip) autoscale() {
-	// Get all ministers and their status.
 	allMinisters, err := w.db.ListMinisters()
 	if err != nil {
 		slog.Debug("autoscale: 拉取部长列表失败", "err", err)
 		return
 	}
 
-	// Count by status.
-	var idle int
+	var idle, active int
 	var idleMinisters []*store.Minister
 	for _, m := range allMinisters {
-		if m.Status == "idle" {
+		switch m.Status {
+		case "idle":
 			idle++
+			active++
 			idleMinisters = append(idleMinisters, m)
+		case "working":
+			active++
 		}
 	}
 
-	// Count pending bills (draft or reading status, not assigned).
 	allBills, err := w.db.ListBills()
 	if err != nil {
 		slog.Debug("autoscale: 拉取议案列表失败", "err", err)
 		return
 	}
 
-	var pendingBills int
-	for _, b := range allBills {
-		if (b.Status == "draft" || b.Status == "reading") && b.Assignee.String == "" {
-			pendingBills++
-		}
-	}
-
+	pending := listPendingBills(allBills)
+	pendingCount := len(pending)
 	upThresh := w.scaleUpThreshold()
 	downThresh := w.scaleDownThreshold()
 
-	// Scale up: pending bills > idle ministers * threshold
-	if pendingBills > idle*upThresh && pendingBills > 0 {
-		// Collect reserve pool: offline ministers with skills.
-		reservePool, err := w.db.ListOfflineMinisters()
-		if err != nil || len(reservePool) == 0 {
+	if shouldScaleUp(pendingCount, idle, upThresh) {
+		reservePool, poolErr := w.db.ListOfflineMinisters()
+		switch {
+		case poolErr != nil:
+			slog.Debug("autoscale: 拉取预备池失败", "err", poolErr)
+		case len(reservePool) == 0:
 			slog.Debug("autoscale: 无可用预备池部长")
-		} else {
-			// Activate one minister from the reserve pool.
-			m := reservePool[0]
-			slog.Info("autoscale: 从预备池激活部长", "minister_id", m.ID, "pending_bills", pendingBills, "idle", idle)
-			if err := w.db.UpdateMinisterStatus(m.ID, "idle"); err != nil {
-				slog.Error("autoscale: update minister status idle", "minister_id", m.ID, "err", err)
-			} else {
-				if err := w.db.RecordEvent("autoscale.triggered", "whip", "", m.ID, "", fmt.Sprintf(`{"direction":"up","pending":%d,"idle":%d,"activated":"%s"}`, pendingBills, idle, m.ID)); err != nil {
-					slog.Warn("记录 autoscale.triggered 事件失败", "minister_id", m.ID, "err", err)
-				}
-
-				g := &store.Gazette{
-					ID:      gazetteID(),
-					Type:    store.NullString("autoscale"),
-					Summary: fmt.Sprintf("自动扩容：部长 [%s] %s 已从预备池激活（待处理 %d > 空闲 %d × %d）", m.ID, m.Title, pendingBills, idle, upThresh),
-				}
-				if err := w.db.CreateGazette(g); err != nil {
-					slog.Warn("autoscale: create scale-up gazette", "err", err)
-				}
-			}
+		default:
+			w.scaleUpTick(pending, reservePool, active, pendingCount, idle, upThresh)
 		}
 	}
 
-	// Scale down: idle ministers > pending bills + threshold
-	if idle > pendingBills+downThresh && idle > downThresh {
-		// Dismiss the oldest idle minister.
-		if len(idleMinisters) > 0 {
-			m := idleMinisters[0]
-			slog.Info("autoscale: 准备缩容", "idle_ministers", idle, "pending_bills", pendingBills)
-			if err := w.db.RecordEvent("autoscale.triggered", "whip", "", m.ID, "", fmt.Sprintf(`{"direction":"down","pending":%d,"idle":%d}`, pendingBills, idle)); err != nil {
-				slog.Warn("记录 autoscale.triggered 事件失败", "minister_id", m.ID, "err", err)
-			}
+	if shouldScaleDown(pendingCount, idle, downThresh) && len(idleMinisters) > 0 {
+		w.scaleDownOne(idleMinisters[0], pendingCount, idle, downThresh)
+	}
+}
 
-			if err := w.db.UpdateMinisterStatus(m.ID, "offline"); err != nil {
-				slog.Error("autoscale: update minister status offline", "minister_id", m.ID, "err", err)
-			} else {
-				g := &store.Gazette{
-					ID:      gazetteID(),
-					Type:    store.NullString("autoscale"),
-					Summary: fmt.Sprintf("自动缩容：部长 [%s] 已离线（空闲 %d > 待处理 %d + %d）", m.ID, idle, pendingBills, downThresh),
-				}
-				if err := w.db.CreateGazette(g); err != nil {
-					slog.Warn("autoscale: create scale-down gazette", "err", err)
-				}
-			}
+// scaleUpTick summons up to maxScaleUpPerTick ministers from the reserve pool,
+// pairing each with a skill-matched pending bill. Respects cfg.Whip.MaxMinisters
+// as a hard cap on total active (working + idle) ministers.
+func (w *Whip) scaleUpTick(pending []*store.Bill, reserve []*store.Minister, active, pendingCount, idle, upThresh int) {
+	budget := maxScaleUpPerTick
+	if w.cfg != nil && w.cfg.Whip.MaxMinisters > 0 {
+		if room := w.cfg.Whip.MaxMinisters - active; room < budget {
+			budget = room
 		}
 	}
+	if budget <= 0 {
+		slog.Debug("autoscale: 已达 max_ministers 上限，跳过扩容", "active", active)
+		return
+	}
+
+	remainingBills := pending
+	remainingMinisters := reserve
+	for summoned := 0; summoned < budget; summoned++ {
+		bill, m := matchBillToMinister(remainingBills, remainingMinisters)
+		if bill == nil || m == nil {
+			return
+		}
+		if !w.summonReserve(bill, m, pendingCount, idle, upThresh) {
+			return
+		}
+		remainingBills = removeBillByID(remainingBills, bill.ID)
+		remainingMinisters = removeMinisterByID(remainingMinisters, m.ID)
+	}
+}
+
+// summonReserve activates a reserve minister and — when the bill's project is
+// known — drives the full summon pipeline (chamber + runtime). When the project
+// cannot be resolved, falls back to the old behaviour (offline → idle) so
+// orderPaper can match the minister to the bill on a later tick.
+//
+// Returns true when any action was taken (so the caller can keep iterating);
+// false signals a hard failure that should stop the scale-up loop for this tick.
+func (w *Whip) summonReserve(bill *store.Bill, m *store.Minister, pendingCount, idle, upThresh int) bool {
+	project := w.projectForBill(bill)
+	if project == "" {
+		slog.Info("autoscale: 激活预备池部长（无项目，留待下轮派发）",
+			"minister_id", m.ID, "pending_bills", pendingCount, "idle", idle)
+		if err := w.db.UpdateMinisterStatus(m.ID, "idle"); err != nil {
+			slog.Error("autoscale: activate minister", "minister_id", m.ID, "err", err)
+			return false
+		}
+		if err := w.db.RecordEvent("autoscale.triggered", "whip", "", m.ID, "",
+			fmt.Sprintf(`{"direction":"up","pending":%d,"idle":%d,"activated":"%s"}`,
+				pendingCount, idle, m.ID)); err != nil {
+			slog.Warn("记录 autoscale.triggered 事件失败", "minister_id", m.ID, "err", err)
+		}
+		g := &store.Gazette{
+			ID:      gazetteID(),
+			Type:    store.NullString("autoscale"),
+			Summary: fmt.Sprintf("自动扩容：部长 [%s] %s 已从预备池激活（待处理 %d > 空闲 %d × %d）", m.ID, m.Title, pendingCount, idle, upThresh),
+		}
+		if err := w.db.CreateGazette(g); err != nil {
+			slog.Warn("autoscale: create scale-up gazette", "err", err)
+		}
+		return true
+	}
+
+	slog.Info("autoscale: 从预备池传召部长",
+		"minister_id", m.ID, "bill_id", bill.ID, "project", project,
+		"pending_bills", pendingCount, "idle", idle)
+	if err := w.db.UpdateMinisterStatus(m.ID, "idle"); err != nil {
+		slog.Error("autoscale: mark idle", "minister_id", m.ID, "err", err)
+		return false
+	}
+
+	res, err := ministerpkg.Summon(ministerpkg.SummonOpts{
+		DB:          w.db,
+		HocDir:      w.hocDir,
+		MinisterID:  m.ID,
+		BillID:      bill.ID,
+		ProjectName: project,
+		UseTmux:     true,
+	})
+	if err != nil {
+		slog.Warn("autoscale: summon failed", "minister_id", m.ID, "bill_id", bill.ID, "err", err)
+		// Summon already rolled back its side effects. Leave the minister idle so
+		// a future tick (or orderPaper) can retry.
+		return true
+	}
+
+	if err := w.db.RecordEvent("autoscale.triggered", "whip", bill.ID, m.ID, bill.SessionID.String,
+		fmt.Sprintf(`{"direction":"up","pending":%d,"idle":%d,"activated":"%s","bill":"%s","branch":"%s"}`,
+			pendingCount, idle, m.ID, bill.ID, res.Branch)); err != nil {
+		slog.Warn("记录 autoscale.triggered 事件失败", "minister_id", m.ID, "err", err)
+	}
+	g := &store.Gazette{
+		ID:   gazetteID(),
+		Type: store.NullString("autoscale"),
+		Summary: fmt.Sprintf("自动扩容：部长 [%s] %s 已从预备池传召至议案 [%s]（分支 %s）",
+			m.ID, m.Title, bill.ID, res.Branch),
+	}
+	if err := w.db.CreateGazette(g); err != nil {
+		slog.Warn("autoscale: create scale-up gazette", "err", err)
+	}
+	return true
+}
+
+// scaleDownOne marks the oldest idle minister as offline with an accompanying
+// audit event and gazette.
+func (w *Whip) scaleDownOne(m *store.Minister, pendingCount, idle, downThresh int) {
+	slog.Info("autoscale: 准备缩容", "idle_ministers", idle, "pending_bills", pendingCount)
+	if err := w.db.RecordEvent("autoscale.triggered", "whip", "", m.ID, "",
+		fmt.Sprintf(`{"direction":"down","pending":%d,"idle":%d}`, pendingCount, idle)); err != nil {
+		slog.Warn("记录 autoscale.triggered 事件失败", "minister_id", m.ID, "err", err)
+	}
+	if err := w.db.UpdateMinisterStatus(m.ID, "offline"); err != nil {
+		slog.Error("autoscale: update minister status offline", "minister_id", m.ID, "err", err)
+		return
+	}
+	g := &store.Gazette{
+		ID:      gazetteID(),
+		Type:    store.NullString("autoscale"),
+		Summary: fmt.Sprintf("自动缩容：部长 [%s] 已离线（空闲 %d > 待处理 %d + %d）", m.ID, idle, pendingCount, downThresh),
+	}
+	if err := w.db.CreateGazette(g); err != nil {
+		slog.Warn("autoscale: create scale-down gazette", "err", err)
+	}
+}
+
+// projectForBill resolves the chamber project for a bill. Prefers bill.Project
+// when present; otherwise follows bill → session → session.Project. Returns
+// "" when neither is set.
+func (w *Whip) projectForBill(bill *store.Bill) string {
+	if bill.Project.String != "" {
+		return bill.Project.String
+	}
+	if !bill.SessionID.Valid || bill.SessionID.String == "" {
+		return ""
+	}
+	sess, err := w.db.GetSession(bill.SessionID.String)
+	if err != nil || sess == nil {
+		return ""
+	}
+	return sess.Project.String
+}
+
+// removeBillByID returns a new slice with the matching bill dropped. O(n).
+func removeBillByID(bills []*store.Bill, id string) []*store.Bill {
+	out := make([]*store.Bill, 0, len(bills))
+	for _, b := range bills {
+		if b.ID != id {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// removeMinisterByID returns a new slice with the matching minister dropped. O(n).
+func removeMinisterByID(ms []*store.Minister, id string) []*store.Minister {
+	out := make([]*store.Minister, 0, len(ms))
+	for _, m := range ms {
+		if m.ID != id {
+			out = append(out, m)
+		}
+	}
+	return out
 }

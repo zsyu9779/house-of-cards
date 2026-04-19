@@ -3,10 +3,10 @@ package cmd
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 
 	"github.com/house-of-cards/hoc/internal/config"
+	"github.com/house-of-cards/hoc/internal/logger"
 	"github.com/house-of-cards/hoc/internal/otel"
 	"github.com/spf13/cobra"
 )
@@ -17,6 +17,8 @@ var (
 	BuildTime = "unknown"
 	verbose   bool
 	quiet     bool
+	logLevel  string
+	logFormat string
 )
 
 // rootCmd represents the base command.
@@ -36,22 +38,41 @@ var rootCmd = &cobra.Command{
 }
 
 // initLogging sets up the global slog handler and observability provider.
-// Default level: INFO (show operational logs without --verbose).
-// --verbose: DEBUG (detailed internal tracing).
-// --quiet:   ERROR (suppress INFO/WARN, only show errors).
+//
+// Priority for level:
+//  1. --log-level (explicit)
+//  2. --verbose (=> debug) / --quiet (=> error)
+//  3. config.toml [log].level
+//  4. "info"
+//
+// Priority for format: --log-format > config.toml [log].format > "text".
 func initLogging(_ *cobra.Command, _ []string) error {
-	level := slog.LevelInfo
-	if verbose {
-		level = slog.LevelDebug
-	} else if quiet {
-		level = slog.LevelError
+	hocHome := config.GetHOCHome()
+	cfg, cfgErr := config.LoadConfig(hocHome)
+
+	cliLevel := logLevel
+	if cliLevel == "" {
+		switch {
+		case verbose:
+			cliLevel = "debug"
+		case quiet:
+			cliLevel = "error"
+		}
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	slog.SetDefault(slog.New(h))
+
+	var cfgLevel, cfgFormat string
+	if cfgErr == nil {
+		cfgLevel = cfg.Log.Level
+		cfgFormat = cfg.Log.Format
+	}
+
+	logger.Init(logger.Options{
+		Level:  logger.Resolve(cliLevel, cfgLevel, "info"),
+		Format: logger.Resolve(logFormat, cfgFormat, "text"),
+	})
 
 	// Initialise the global observability provider from config.
-	hocHome := config.GetHOCHome()
-	if cfg, err := config.LoadConfig(hocHome); err == nil {
+	if cfgErr == nil {
 		obs := cfg.Observability
 		otel.InitFromConfig(otel.ExporterConfig{
 			Type:         obs.Exporter,
@@ -59,7 +80,6 @@ func initLogging(_ *cobra.Command, _ []string) error {
 			ServiceName:  obs.ServiceName,
 		})
 	} else {
-		// Fallback to nop if config cannot be loaded.
 		otel.InitFromConfig(otel.DefaultExporterConfig())
 	}
 
@@ -78,6 +98,8 @@ func Execute() {
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "启用详细日志输出（DEBUG 级别）")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "静默模式，只输出错误（ERROR 级别）")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "", "日志级别 (debug/info/warn/error)，优先于 --verbose/--quiet 与 config.toml")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "", "日志格式 (text/json)，优先于 config.toml")
 
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(ministersCmd)

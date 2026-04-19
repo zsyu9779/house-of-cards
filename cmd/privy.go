@@ -139,7 +139,7 @@ var privyMergeCmd = &cobra.Command{
 				Type:    store.NullString("completion"),
 				Summary: summary,
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "session_id", sessionID)
 
 			fmt.Printf("✅ 枢密院合并成功！\n")
 			fmt.Printf("   合并分支: %s\n", result.MergeBranch)
@@ -159,7 +159,7 @@ var privyMergeCmd = &cobra.Command{
 				Type:    store.NullString("conflict"),
 				Summary: summary,
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "session_id", sessionID)
 
 			fmt.Printf("⚠  枢密院合并冲突\n")
 			fmt.Printf("   冲突议案: %s\n", strings.Join(result.ConflictBills, ", "))

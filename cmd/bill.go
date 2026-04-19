@@ -216,7 +216,8 @@ var billDraftCmd = &cobra.Command{
 		if err := db.CreateBill(bill); err != nil {
 			return fmt.Errorf("create bill: %w", err)
 		}
-		_ = db.RecordEvent("bill.created", "cli", billID, "", bill.SessionID.String, "")
+		warnIfErr("record event", db.RecordEvent("bill.created", "cli", billID, "", bill.SessionID.String, ""),
+			"event", "bill.created", "bill_id", billID)
 
 		fmt.Printf("📄 议案已起草\n")
 		fmt.Printf("   ID:    %s\n", billID)
@@ -285,7 +286,7 @@ var billAssignCmd = &cobra.Command{
 			Type:       store.NullString("handoff"),
 			Summary:    summary,
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 		return nil
 	},
@@ -351,7 +352,7 @@ var billEnactedCmd = &cobra.Command{
 			Type:         store.NullString("completion"),
 			Summary:      summary,
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 		fmt.Printf("✅ 议案 [%s] \"%s\" 已标记为 Enacted\n", billID, b.Title)
 		if ministerID != "" {
@@ -403,7 +404,7 @@ var billCommitteeCmd = &cobra.Command{
 			Type:         store.NullString("review"),
 			Summary:      summary,
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 		fmt.Printf("📋 议案 [%s] \"%s\" 已提交委员会\n", billID, b.Title)
 		fmt.Printf("   状态: %s → committee\n", b.Status)
@@ -467,7 +468,7 @@ var billReviewCmd = &cobra.Command{
 					Quality:    quality,
 					Notes:      store.NullString(notes),
 				}
-				_ = db.CreateHansard(h)
+				warnIfErr("create hansard", db.CreateHansard(h), "hansard_id", h.ID, "bill_id", billID)
 			}
 
 			// Create Review Gazette (pass).
@@ -485,7 +486,7 @@ var billReviewCmd = &cobra.Command{
 				Type:       store.NullString("review"),
 				Summary:    summary,
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 			fmt.Printf("✅ 委员会审查通过：议案 [%s] \"%s\"\n", billID, b.Title)
 			fmt.Printf("   状态: committee → enacted\n")
@@ -510,7 +511,7 @@ var billReviewCmd = &cobra.Command{
 				Type:       store.NullString("review"),
 				Summary:    summary,
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 			fmt.Printf("🔄 委员会审查退回：议案 [%s] \"%s\"\n", billID, b.Title)
 			fmt.Printf("   状态: committee → reading（请部长修改后重新提交）\n")
@@ -555,7 +556,8 @@ var billPauseCmd = &cobra.Command{
 		}
 
 		payload := fmt.Sprintf(`{"prev_status":"%s","reason":"%s"}`, prevStatus, reason)
-		_ = db.RecordEvent("governance.bill_paused", "cli", billID, b.Assignee.String, b.SessionID.String, payload)
+		warnIfErr("record event", db.RecordEvent("governance.bill_paused", "cli", billID, b.Assignee.String, b.SessionID.String, payload),
+			"event", "governance.bill_paused", "bill_id", billID)
 
 		summary := fmt.Sprintf("治理公报：议案 [%s] \"%s\" 已暂停（%s → draft）。", billID, b.Title, prevStatus)
 		if reason != "" {
@@ -567,7 +569,7 @@ var billPauseCmd = &cobra.Command{
 			Type:    store.NullString("handoff"),
 			Summary: summary,
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", billID)
 
 		fmt.Printf("⏸  议案 [%s] \"%s\" 已暂停\n", billID, b.Title)
 		fmt.Printf("   状态: %s → draft  负责人: 已清除\n", prevStatus)
@@ -598,7 +600,8 @@ var billResumeCmd = &cobra.Command{
 			return fmt.Errorf("议案状态为 [%s]，只有 draft 状态的议案可恢复", b.Status)
 		}
 
-		_ = db.RecordEvent("governance.bill_resumed", "cli", billID, "", b.SessionID.String, "")
+		warnIfErr("record event", db.RecordEvent("governance.bill_resumed", "cli", billID, "", b.SessionID.String, ""),
+			"event", "governance.bill_resumed", "bill_id", billID)
 
 		fmt.Printf("▶  议案 [%s] \"%s\" 已恢复（状态: draft，可被 Whip 重新派发）\n", billID, b.Title)
 		return nil
@@ -664,7 +667,8 @@ var billSplitCmd = &cobra.Command{
 		}
 
 		payload := fmt.Sprintf(`{"sub_bills":%d}`, len(subIDs))
-		_ = db.RecordEvent("bill.split", "cli", billID, "", b.SessionID.String, payload)
+		warnIfErr("record event", db.RecordEvent("bill.split", "cli", billID, "", b.SessionID.String, payload),
+			"event", "bill.split", "bill_id", billID)
 
 		fmt.Printf("\n✂  议案 [%s] \"%s\" 已拆分为 %d 个子议案（状态: epic）\n", billID, b.Title, len(subIDs))
 		return nil

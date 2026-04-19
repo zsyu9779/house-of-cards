@@ -6,6 +6,7 @@ package speaker
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -213,30 +214,44 @@ func writePatrolPrompt(path, contextContent string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
+// SummonResult carries the outcome of a Speaker summon for the CLI caller.
+// TmuxSession is the tmux session name when the speaker was started in
+// detached mode; it is empty for interactive (foreground) runs.
+type SummonResult struct {
+	TmuxSession string
+}
+
 // Summon starts the Speaker AI session with the current context injected.
 // useTmux=true runs in a detached tmux session named "hoc-speaker".
 // useTmux=false runs interactively in the foreground.
-func Summon(hocDir string, useTmux bool) error {
+//
+// User-facing feedback (e.g. "speaker is ready") is NOT printed here — the
+// caller (cmd layer) is responsible for rendering based on the returned
+// SummonResult. This keeps internal packages free of fmt.Print calls.
+func Summon(hocDir string, useTmux bool) (SummonResult, error) {
 	ctxPath := ContextPath(hocDir)
 	if _, err := os.Stat(ctxPath); os.IsNotExist(err) {
-		return fmt.Errorf("Speaker context 文件不存在：%s\n请先运行 hoc speaker context --refresh", ctxPath)
+		return SummonResult{}, fmt.Errorf("Speaker context 文件不存在：%s\n请先运行 hoc speaker context --refresh", ctxPath)
 	}
 
 	// Read the context content to embed directly in the prompt.
 	ctxBytes, err := os.ReadFile(ctxPath)
 	if err != nil {
-		return fmt.Errorf("read speaker context: %w", err)
+		return SummonResult{}, fmt.Errorf("read speaker context: %w", err)
 	}
 	contextContent := string(ctxBytes)
 
 	speakerPromptPath := filepath.Join(hocDir, ".hoc", "speaker", "prompt.md")
 	if err := writeSpeakerPrompt(speakerPromptPath, contextContent); err != nil {
-		return fmt.Errorf("write speaker prompt: %w", err)
+		return SummonResult{}, fmt.Errorf("write speaker prompt: %w", err)
 	}
 
 	if useTmux {
 		tmuxName := "hoc-speaker"
-		_ = exec.Command("tmux", "kill-session", "-t", tmuxName).Run()
+		if err := exec.Command("tmux", "kill-session", "-t", tmuxName).Run(); err != nil {
+			// Non-fatal: session may simply not exist yet.
+			slog.Debug("tmux kill-session (pre-summon)", "session", tmuxName, "err", err)
+		}
 
 		shellCmd := fmt.Sprintf("claude -p @%s", speakerPromptPath)
 		cmd := exec.Command("tmux", "new-session", "-d",
@@ -245,20 +260,19 @@ func Summon(hocDir string, useTmux bool) error {
 			shellCmd,
 		)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("tmux start: %w\n%s", err, string(output))
+			return SummonResult{}, fmt.Errorf("tmux start: %w\n%s", err, string(output))
 		}
-		fmt.Printf("✅ 议长已在 tmux 会话 [hoc-speaker] 中就绪\n")
-		fmt.Printf("   查看: tmux attach -t hoc-speaker\n")
-	} else {
-		// Interactive foreground mode.
-		cmd := exec.Command("claude", "-p", "@"+speakerPromptPath)
-		cmd.Dir = hocDir
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
+		slog.Info("speaker summoned in tmux", "session", tmuxName)
+		return SummonResult{TmuxSession: tmuxName}, nil
 	}
-	return nil
+
+	// Interactive foreground mode.
+	cmd := exec.Command("claude", "-p", "@"+speakerPromptPath)
+	cmd.Dir = hocDir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return SummonResult{}, cmd.Run()
 }
 
 // writeSpeakerPrompt writes the speaker's initial system prompt with the

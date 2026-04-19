@@ -1,5 +1,42 @@
 # Agent Context Archive
 
+## 2026-04-19 — v0.3 Phase 3 PR-13 E-3 OTLP stub 标注
+
+三处改动：`internal/config/config.go` `Validate()` 显式拒绝 `"otlp"`；`internal/otel/tracer.go` `NewOTLPExporter` 加 `slog.Warn`；`cmd/doctor.go` 新增 Step 8 检查。测试 `TestDoctor_OTLPStubFlagged`、config_test `otlp exporter is stub`。build/vet/lint/race 全绿。
+
+---
+
+## 2026-04-19 — v0.3 Phase 3 PR-10 C-2 结构化日志统一
+
+新包 `internal/logger/`（`Init` / `Build` / `ParseLevel` / `Resolve`）+ 10+ 测试，覆盖 100%。`internal/config` 新增 `LogConfig` + 校验；`fmt.Fprintf(os.Stderr)` → `slog.Error`。`cmd/root.go` 改用 `logger.Init`，新增 `--log-level` / `--log-format`，优先级 CLI > `-v/-q` > config > "info"/"text"。`internal/chamber` branch 删除失败 `fmt.Printf` → `slog.Warn`。保留 `internal/speaker` tmux 提示、`cmd/*` ✓/✗ 表格、`internal/otel` stdout exporter 数据流。
+
+---
+
+## 2026-04-19 — v0.3 Phase 3 PR-9 Autoscale 全链路
+
+新包 `internal/minister/`（`summon.go` / `brief.go` / `claude_md.go`），`Summon(SummonOpts)` 做 resolve → chamber → CLAUDE.md → brief+upstream → runtime.Summon → DB 更新；defer 回滚。`internal/whip/scheduler.go` 拆纯函数 `shouldScaleUp` / `shouldScaleDown` / `listPendingBills` / `matchBillToMinister` / `hasSkill`；`autoscale()` → `scaleUpTick` + `summonReserve` + `scaleDownOne`；常量 `maxScaleUpPerTick=2`，尊重 `cfg.Whip.MaxMinisters`。`cmd/ministers.go` 瘦身为 `ministerpkg.Summon` 薄包装。minister 覆盖率 73.1%。
+
+---
+
+## 2026-04-18 — v0.3 Phase 2 PR-8 Context Health
+
+`internal/store/gazette.go` 新增 `ContextHealth{TokensUsed, TokensLimit, TurnsElapsed}`；`store.go` 新增 `GetLatestContextHealth(ministerID)` 从最近一条含 `context_health` payload 的 Gazette 解包。`internal/whip/context_health.go` 常量 `warn=0.80 / crit=0.90 / cooldown=5m`，`checkContextHealth()` 遍历 working ministers，按阈值分发 warn / critical gazette，critical 额外 `RecordEvent("bill.context_critical", ...)`。Whip struct 加 `lastContextAlert map[string]time.Time`；`tick()` 在 committeeAutomation 后调用。`minister/claude_md.go` 追加"上下文健康报告"章节要求。9 个新测试全 PASS；whip 63.9%，store 52.6%。
+
+---
+
+## 2026-04-18 — v0.3 Phase 2 PR-6 / PR-7
+
+### PR-6: B-2 Store 并发测试
+- store 49.1% → 54.3%
+- 生产 bug 修复：`NewDB` DSN 加 WAL + `busy_timeout=5000`
+- `RecordEvent` 改 `newEventID()`（crypto/rand 4 字节后缀）
+
+### PR-7: E-1.3 Store 错误治理
+- `migrate()` 重写 ALTER TABLE 循环（`isDuplicateColumnErr` helper，非幂等错误 slog.Warn）
+- `GetWhipStats()` 显式 error 处理
+
+---
+
 ## 2026-04-06 — v0.3 Phase 1 完成总结
 
 Phase 1 全部 4 个 PR 完成：

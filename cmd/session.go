@@ -79,6 +79,8 @@ func init() {
 	sessionMigrateCmd.Flags().String("project", "", "迁移时使用的默认项目名称")
 	sessionMigrateCmd.Flags().Bool("confirm", false, "执行迁移（默认为预演模式）")
 
+	sessionDissolveCmd.Flags().Bool("confirm", false, "跳过交互确认，直接解散")
+
 	sessionStatsCmd.Flags().Bool("all", false, "显示所有会期的汇总统计")
 
 	sessionPauseCmd.Flags().String("reason", "", "暂停原因")
@@ -217,7 +219,8 @@ var sessionOpenCmd = &cobra.Command{
 			if err := db.CreateBill(bill); err != nil {
 				return fmt.Errorf("create bill %s: %w", bs.ID, err)
 			}
-			_ = db.RecordEvent("bill.created", "cli", billID, "", sid, "")
+			warnIfErr("record event", db.RecordEvent("bill.created", "cli", billID, "", sid, ""),
+				"event", "bill.created", "bill_id", billID)
 			notes := ""
 			if bs.Portfolio != "" {
 				notes = fmt.Sprintf(" [portfolio: %s]", bs.Portfolio)
@@ -439,7 +442,11 @@ func splitLines(s string) []string {
 var sessionDissolveCmd = &cobra.Command{
 	Use:   "dissolve [session-id]",
 	Short: "解散会期",
-	Args:  cobra.ExactArgs(1),
+	Long: `解散会期。此操作会将会期标记为 dissolved，所有未完成的议案将不再被调度。
+
+默认需要交互式输入会期 ID 进行二次确认。
+使用 --confirm 跳过确认。`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := initDB(); err != nil {
 			return err
@@ -450,6 +457,23 @@ var sessionDissolveCmd = &cobra.Command{
 		s, err := db.GetSession(sid)
 		if err != nil {
 			return fmt.Errorf("session not found: %s", sid)
+		}
+
+		if s.Status == "dissolved" {
+			return fmt.Errorf("会期 [%s] 已处于 dissolved 状态", sid)
+		}
+
+		confirm, _ := cmd.Flags().GetBool("confirm")
+		if !confirm {
+			warning := fmt.Sprintf("⚠️  即将解散会期 [%s] %s\n   所有未完成的议案将不再被调度。", sid, s.Title)
+			ok, err := util.DefaultPrompter().ConfirmTyped(warning, sid)
+			if err != nil {
+				return fmt.Errorf("read confirmation: %w", err)
+			}
+			if !ok {
+				fmt.Println("✗ 已取消。")
+				return nil
+			}
 		}
 
 		if err := db.UpdateSessionStatus(sid, "dissolved"); err != nil {
@@ -633,7 +657,8 @@ var sessionPauseCmd = &cobra.Command{
 		}
 
 		payload := fmt.Sprintf(`{"reason":"%s"}`, reason)
-		_ = db.RecordEvent("governance.session_paused", "cli", "", "", sid, payload)
+		warnIfErr("record event", db.RecordEvent("governance.session_paused", "cli", "", "", sid, payload),
+			"event", "governance.session_paused", "session_id", sid)
 
 		fmt.Printf("⏸  会期 [%s] \"%s\" 已暂停\n", sid, s.Title)
 		if reason != "" {
@@ -668,7 +693,8 @@ var sessionResumeCmd = &cobra.Command{
 			return fmt.Errorf("update session status: %w", err)
 		}
 
-		_ = db.RecordEvent("governance.session_resumed", "cli", "", "", sid, "")
+		warnIfErr("record event", db.RecordEvent("governance.session_resumed", "cli", "", "", sid, ""),
+			"event", "governance.session_resumed", "session_id", sid)
 
 		fmt.Printf("▶  会期 [%s] \"%s\" 已恢复（paused → active）\n", sid, s.Title)
 		return nil
@@ -708,7 +734,8 @@ var sessionAdvanceCmd = &cobra.Command{
 			}
 		}
 
-		_ = db.RecordEvent("governance.session_advanced", "cli", "", "", sid, "")
+		warnIfErr("record event", db.RecordEvent("governance.session_advanced", "cli", "", "", sid, ""),
+			"event", "governance.session_advanced", "session_id", sid)
 
 		// List draft bills for visibility.
 		bills, err := db.ListBillsBySession(sid)

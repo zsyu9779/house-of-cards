@@ -72,7 +72,15 @@ var speakerSummonCmd = &cobra.Command{
 		}
 
 		fmt.Println("🎙  传召议长 (Speaker)...")
-		return speaker.Summon(hocDir, !noTmux)
+		res, err := speaker.Summon(hocDir, !noTmux)
+		if err != nil {
+			return err
+		}
+		if res.TmuxSession != "" {
+			fmt.Printf("✅ 议长已在 tmux 会话 [%s] 中就绪\n", res.TmuxSession)
+			fmt.Printf("   查看: tmux attach -t %s\n", res.TmuxSession)
+		}
+		return nil
 	},
 }
 
@@ -236,7 +244,8 @@ func execDecision(d speaker.Decision) {
 			return
 		}
 		branch := fmt.Sprintf("minister/%s", d.Secondary)
-		_ = db.UpdateBillBranch(d.Target, branch)
+		warnIfErr("update bill branch", db.UpdateBillBranch(d.Target, branch),
+			"bill_id", d.Target, "branch", branch)
 
 		// Create handoff gazette.
 		gazetteID := fmt.Sprintf("gaz-%d", time.Now().UnixNano())
@@ -247,7 +256,8 @@ func execDecision(d speaker.Decision) {
 			Type:       store.NullString("handoff"),
 			Summary:    fmt.Sprintf("由议长巡视自动分配：议案 [%s] \"%s\" 已分配给 %s", d.Target, bill.Title, minister.Title),
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID,
+			"bill_id", d.Target, "minister_id", d.Secondary)
 		fmt.Printf("      ✅ 完成\n")
 
 	case "by-election":
@@ -267,11 +277,12 @@ func execDecision(d speaker.Decision) {
 		}
 
 		// Mark minister as offline.
-		_ = db.UpdateMinisterStatus(d.Target, "offline")
+		warnIfErr("update minister status", db.UpdateMinisterStatus(d.Target, "offline"),
+			"minister_id", d.Target, "target_status", "offline")
 
 		// Clear bill assignment if exists.
 		if billID != "" {
-			_ = db.ClearBillAssignment(billID)
+			warnIfErr("clear bill assignment", db.ClearBillAssignment(billID), "bill_id", billID)
 		}
 
 		// Create handoff gazette.
@@ -283,7 +294,8 @@ func execDecision(d speaker.Decision) {
 				Type:    store.NullString("handoff"),
 				Summary: fmt.Sprintf("补选触发：部长 [%s] 离开，议案 [%s] 待重新分配", d.Target, billID),
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID,
+				"minister_id", d.Target, "bill_id", billID)
 		}
 
 		// Create hansard record.
@@ -295,7 +307,8 @@ func execDecision(d speaker.Decision) {
 				Outcome:    store.NullString("failed"),
 				Notes:      store.NullString("补选触发：由 Speaker 巡视自动检测到 stuck 状态"),
 			}
-			_ = db.CreateHansard(h)
+			warnIfErr("create hansard", db.CreateHansard(h), "hansard_id", h.ID,
+				"minister_id", d.Target, "bill_id", billID)
 		}
 
 		fmt.Printf("      ✅ 补选完成，部长已标记为 offline\n")
@@ -316,7 +329,7 @@ func execDecision(d speaker.Decision) {
 			Type:    store.NullString("escalation"),
 			Summary: fmt.Sprintf("⚠ 议案 [%s] \"%s\" 已升级到议长，需要特别关注", d.Target, bill.Title),
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "bill_id", d.Target)
 		fmt.Printf("      ✅ 已生成升级公报\n")
 
 	default:

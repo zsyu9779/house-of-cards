@@ -8,14 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/house-of-cards/hoc/internal/chamber"
 	"github.com/house-of-cards/hoc/internal/config"
+	ministerpkg "github.com/house-of-cards/hoc/internal/minister"
 	"github.com/house-of-cards/hoc/internal/runtime"
 	"github.com/house-of-cards/hoc/internal/store"
+	"github.com/house-of-cards/hoc/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -86,6 +86,8 @@ func init() {
 	ministerAutoCmd.Flags().Int("max-concurrent", 3, "最多同时运行的部长数量")
 	ministerAutoCmd.Flags().Bool("no-tmux", false, "前台运行（不使用 tmux）")
 
+	ministerDismissCmd.Flags().Bool("confirm", false, "跳过交互确认，直接休会")
+
 	// Phase 3B: hook subcommands
 	ministerHookCmd.AddCommand(ministerHookPushCmd)
 	ministerHookCmd.AddCommand(ministerHookListCmd)
@@ -152,7 +154,7 @@ var ministerSummonCmd = &cobra.Command{
 		projectName, _ := cmd.Flags().GetString("project")
 		noTmux, _ := cmd.Flags().GetBool("no-tmux")
 
-		minister, err := db.GetMinister(ministerID)
+		m, err := db.GetMinister(ministerID)
 		if err != nil {
 			return fmt.Errorf("minister not found: %s", ministerID)
 		}
@@ -162,99 +164,46 @@ var ministerSummonCmd = &cobra.Command{
 			if err := db.UpdateMinisterStatus(ministerID, "idle"); err != nil {
 				return fmt.Errorf("update status: %w", err)
 			}
-			fmt.Printf("✓ 已传召 %s (状态: idle)\n", minister.Title)
+			fmt.Printf("✓ 已传召 %s (状态: idle)\n", m.Title)
 			return nil
 		}
 
-		// Summon with bill: need project.
 		if projectName == "" {
 			return fmt.Errorf("请通过 --project 指定项目名称")
 		}
 
-		// Get bill.
 		bill, err := db.GetBill(billID)
 		if err != nil {
 			return fmt.Errorf("bill not found: %s", billID)
 		}
 
-		// Resolve paths.
-		mainRepoPath := filepath.Join(hocDir, "projects", projectName, "main")
-		if _, err := os.Stat(mainRepoPath); os.IsNotExist(err) {
-			return fmt.Errorf("项目 %s 不存在，请先运行 hoc project add", projectName)
-		}
-
-		// Create / reuse chamber.
-		ch, err := chamber.NewChamber(hocDir, projectName, ministerID, mainRepoPath)
-		if err != nil {
-			return fmt.Errorf("init chamber: %w", err)
-		}
-		if _, statErr := os.Stat(ch.GetWorktreePath()); os.IsNotExist(statErr) {
-			fmt.Printf("⚙  创建议事厅 (git worktree): %s\n", ch.GetWorktreePath())
-			if err := ch.Create(); err != nil {
-				return fmt.Errorf("create chamber: %w", err)
-			}
-		} else {
-			fmt.Printf("⚙  复用现有议事厅: %s\n", ch.GetWorktreePath())
-		}
-
-		// Write CLAUDE.md to chamber (Phase 2: ACK protocol).
-		claudePath := filepath.Join(ch.GetWorktreePath(), ".claude", "CLAUDE.md")
-		if err := os.MkdirAll(filepath.Dir(claudePath), 0755); err != nil {
-			return fmt.Errorf("create .claude dir: %w", err)
-		}
-		claudeContent := buildMinisterCLAUDE(minister, bill, ch.GetBranchName())
-		if err := os.WriteFile(claudePath, []byte(claudeContent), 0644); err != nil {
-			return fmt.Errorf("write CLAUDE.md: %w", err)
-		}
-
-		// Build bill brief.
-		brief := buildBillBrief(minister, bill, ch.GetBranchName())
-
-		// Attach upstream gazettes (handoff / completion / review for this bill).
-		upstreamGazettes, _ := db.ListGazettesForBill(billID)
-		if len(upstreamGazettes) > 0 {
-			var sb strings.Builder
-			sb.WriteString("\n## 上游公报（来自前序部长）\n\n")
-			for _, g := range upstreamGazettes {
-				sb.WriteString(formatUpstreamGazette(g))
-				sb.WriteString("\n---\n\n")
-			}
-			brief += sb.String()
-		}
-
-		// Start runtime.
 		useTmux := !noTmux
-		rt := runtime.New(minister.Runtime, useTmux)
-		opts := runtime.SummonOpts{
-			MinisterID:    ministerID,
-			MinisterTitle: minister.Title,
-			ChamberPath:   ch.GetWorktreePath(),
-			BillBrief:     brief,
-		}
-
-		fmt.Printf("🚀 传召 %s，执行议案 [%s] %s\n", minister.Title, billID, bill.Title)
-		agentSess, err := rt.Summon(opts)
+		fmt.Printf("🚀 传召 %s，执行议案 [%s] %s\n", m.Title, billID, bill.Title)
+		res, err := ministerpkg.Summon(ministerpkg.SummonOpts{
+			DB:          db,
+			HocDir:      hocDir,
+			MinisterID:  ministerID,
+			BillID:      billID,
+			ProjectName: projectName,
+			UseTmux:     useTmux,
+		})
 		if err != nil {
-			return fmt.Errorf("summon runtime: %w", err)
+			return err
 		}
 
-		// Update DB.
-		_ = db.UpdateMinisterStatus(ministerID, "working")
-		_ = db.UpdateMinisterWorktree(ministerID, ch.GetWorktreePath())
-		if agentSess.PID > 0 {
-			_ = db.UpdateMinisterPID(ministerID, agentSess.PID)
+		if res.Reused {
+			fmt.Printf("⚙  复用现有议事厅: %s\n", res.Worktree)
+		} else {
+			fmt.Printf("⚙  创建议事厅 (git worktree): %s\n", res.Worktree)
 		}
-		_ = db.AssignBill(billID, ministerID)
-		_ = db.UpdateBillStatus(billID, "reading")
-		_ = db.UpdateBillBranch(billID, ch.GetBranchName())
 
 		if useTmux {
-			fmt.Printf("✅ %s 已在 tmux 会话 [hoc-%s] 中就绪\n", minister.Title, ministerID)
-			fmt.Printf("   议事厅:  %s\n", ch.GetWorktreePath())
-			fmt.Printf("   分支:    %s\n", ch.GetBranchName())
+			fmt.Printf("✅ %s 已在 tmux 会话 [hoc-%s] 中就绪\n", m.Title, ministerID)
+			fmt.Printf("   议事厅:  %s\n", res.Worktree)
+			fmt.Printf("   分支:    %s\n", res.Branch)
 			fmt.Printf("   查看:    tmux attach -t hoc-%s\n", ministerID)
 		} else {
-			fmt.Printf("✅ %s 已启动 (PID: %d)\n", minister.Title, agentSess.PID)
+			fmt.Printf("✅ %s 已启动 (PID: %d)\n", m.Title, res.PID)
 		}
 		return nil
 	},
@@ -263,7 +212,11 @@ var ministerSummonCmd = &cobra.Command{
 var ministerDismissCmd = &cobra.Command{
 	Use:   "dismiss [name]",
 	Short: "休会 Minister（停止 session）",
-	Args:  cobra.ExactArgs(1),
+	Long: `休会 Minister。此操作会终止 tmux session 并把 Minister 状态置为 offline。
+
+默认需要交互式输入 Minister ID 进行二次确认。
+使用 --confirm 跳过确认。`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := initDB(); err != nil {
 			return err
@@ -274,6 +227,24 @@ var ministerDismissCmd = &cobra.Command{
 		minister, err := db.GetMinister(ministerID)
 		if err != nil {
 			return fmt.Errorf("minister not found: %s", ministerID)
+		}
+
+		if minister.Status == "offline" {
+			return fmt.Errorf("Minister [%s] 已处于 offline 状态", ministerID)
+		}
+
+		confirm, _ := cmd.Flags().GetBool("confirm")
+		if !confirm {
+			warning := fmt.Sprintf("⚠️  即将休会 Minister [%s] %s（当前状态: %s）\n   正在进行的议案将被迫中止。",
+				ministerID, minister.Title, minister.Status)
+			ok, err := util.DefaultPrompter().ConfirmTyped(warning, ministerID)
+			if err != nil {
+				return fmt.Errorf("read confirmation: %w", err)
+			}
+			if !ok {
+				fmt.Println("✗ 已取消。")
+				return nil
+			}
 		}
 
 		// Try to kill tmux session if it exists.
@@ -436,7 +407,7 @@ var ministerByElectionCmd = &cobra.Command{
 				Type:         store.NullString("handoff"),
 				Summary:      summary,
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "minister_id", ministerID, "bill_id", b.ID)
 
 			// Hansard entry.
 			h := &store.Hansard{
@@ -446,7 +417,7 @@ var ministerByElectionCmd = &cobra.Command{
 				Outcome:    store.NullString("failed"),
 				Notes:      store.NullString("手动补选触发"),
 			}
-			_ = db.CreateHansard(h)
+			warnIfErr("create hansard", db.CreateHansard(h), "hansard_id", h.ID, "minister_id", ministerID, "bill_id", b.ID)
 
 			// Reset bill.
 			if err := db.ClearBillAssignment(b.ID); err != nil {
@@ -455,7 +426,8 @@ var ministerByElectionCmd = &cobra.Command{
 			fmt.Printf("   📄 议案 [%s] 已重置为 draft\n", b.ID)
 		}
 
-		_ = db.UpdateMinisterStatus(ministerID, "offline")
+		warnIfErr("update minister status", db.UpdateMinisterStatus(ministerID, "offline"),
+			"minister_id", ministerID, "target_status", "offline")
 		fmt.Printf("✓ 补选完成：%s → offline\n", m.Title)
 		fmt.Printf("  使用 `hoc whip start` 让 Whip 自动重新派发就绪议案。\n")
 		return nil
@@ -488,7 +460,8 @@ var ministerRecoverCmd = &cobra.Command{
 			return fmt.Errorf("update status: %w", err)
 		}
 
-		_ = db.RecordEvent("governance.minister_recovered", "cli", "", ministerID, "", "")
+		warnIfErr("record event", db.RecordEvent("governance.minister_recovered", "cli", "", ministerID, "", ""),
+			"event", "governance.minister_recovered", "minister_id", ministerID)
 
 		summary := fmt.Sprintf("治理公报：部长 [%s] %s 已从 stuck 恢复为 idle。", ministerID, m.Title)
 		g := &store.Gazette{
@@ -498,7 +471,7 @@ var ministerRecoverCmd = &cobra.Command{
 			Summary:      summary,
 			FromMinister: store.NullString("governance"),
 		}
-		_ = db.CreateGazette(g)
+		warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID, "minister_id", ministerID)
 
 		fmt.Printf("✅ 部长 [%s] %s 已恢复（stuck → idle）\n", ministerID, m.Title)
 		return nil
@@ -617,9 +590,22 @@ func autoIterate(db *store.DB, hocDir, sessionFilter, defaultProject string, max
 			}
 
 			fmt.Printf("🤖 自动传召 %s → 议案 [%s] %s\n", minister.Title, bill.ID, bill.Title)
-			if err := doSummon(db, hocDir, minister.ID, bill.ID, project, !noTmux); err != nil {
+			res, err := ministerpkg.Summon(ministerpkg.SummonOpts{
+				DB:          db,
+				HocDir:      hocDir,
+				MinisterID:  minister.ID,
+				BillID:      bill.ID,
+				ProjectName: project,
+				UseTmux:     !noTmux,
+			})
+			if err != nil {
 				slog.Warn("autoIterate: summon failed", "minister", minister.ID, "bill", bill.ID, "err", err)
 				continue
+			}
+			if !noTmux {
+				fmt.Printf("   ✅ %s 已在 tmux [hoc-%s] 就绪\n", minister.Title, minister.ID)
+			} else {
+				fmt.Printf("   ✅ %s 已启动 (PID: %d)\n", minister.Title, res.PID)
 			}
 
 			// Refresh minister from DB for working list.
@@ -630,361 +616,12 @@ func autoIterate(db *store.DB, hocDir, sessionFilter, defaultProject string, max
 	}
 }
 
-// doSummon performs the core summon logic: create/reuse chamber, write bill brief, start runtime, update DB.
-func doSummon(db *store.DB, hocDir, ministerID, billID, projectName string, useTmux bool) error {
-	minister, err := db.GetMinister(ministerID)
-	if err != nil {
-		return fmt.Errorf("minister not found: %s", ministerID)
-	}
-
-	bill, err := db.GetBill(billID)
-	if err != nil {
-		return fmt.Errorf("bill not found: %s", billID)
-	}
-
-	mainRepoPath := filepath.Join(hocDir, "projects", projectName, "main")
-	if _, err := os.Stat(mainRepoPath); os.IsNotExist(err) {
-		return fmt.Errorf("项目 %s 不存在，请先运行 hoc project add", projectName)
-	}
-
-	ch, err := chamber.NewChamber(hocDir, projectName, ministerID, mainRepoPath)
-	if err != nil {
-		return fmt.Errorf("init chamber: %w", err)
-	}
-	if _, statErr := os.Stat(ch.GetWorktreePath()); os.IsNotExist(statErr) {
-		if err := ch.Create(); err != nil {
-			return fmt.Errorf("create chamber: %w", err)
-		}
-	}
-
-	// Write CLAUDE.md to chamber (Phase 2: ACK protocol).
-	claudePath := filepath.Join(ch.GetWorktreePath(), ".claude", "CLAUDE.md")
-	if err := os.MkdirAll(filepath.Dir(claudePath), 0755); err != nil {
-		return fmt.Errorf("create .claude dir: %w", err)
-	}
-	claudeContent := buildMinisterCLAUDE(minister, bill, ch.GetBranchName())
-	if err := os.WriteFile(claudePath, []byte(claudeContent), 0644); err != nil {
-		return fmt.Errorf("write CLAUDE.md: %w", err)
-	}
-
-	brief := buildBillBrief(minister, bill, ch.GetBranchName())
-
-	upstreamGazettes, _ := db.ListGazettesForBill(billID)
-	if len(upstreamGazettes) > 0 {
-		var sb strings.Builder
-		sb.WriteString("\n## 上游公报（来自前序部长）\n\n")
-		for _, g := range upstreamGazettes {
-			sb.WriteString(formatUpstreamGazette(g))
-			sb.WriteString("\n---\n\n")
-		}
-		brief += sb.String()
-	}
-
-	rt := runtime.New(minister.Runtime, useTmux)
-	opts := runtime.SummonOpts{
-		MinisterID:    ministerID,
-		MinisterTitle: minister.Title,
-		ChamberPath:   ch.GetWorktreePath(),
-		BillBrief:     brief,
-	}
-
-	agentSess, err := rt.Summon(opts)
-	if err != nil {
-		return fmt.Errorf("summon runtime: %w", err)
-	}
-
-	_ = db.UpdateMinisterStatus(ministerID, "working")
-	_ = db.UpdateMinisterWorktree(ministerID, ch.GetWorktreePath())
-	if agentSess.PID > 0 {
-		_ = db.UpdateMinisterPID(ministerID, agentSess.PID)
-	}
-	_ = db.AssignBill(billID, ministerID)
-	_ = db.UpdateBillStatus(billID, "reading")
-	_ = db.UpdateBillBranch(billID, ch.GetBranchName())
-
-	if useTmux {
-		fmt.Printf("   ✅ %s 已在 tmux [hoc-%s] 就绪\n", minister.Title, ministerID)
-	} else {
-		fmt.Printf("   ✅ %s 已启动 (PID: %d)\n", minister.Title, agentSess.PID)
-	}
-	return nil
-}
-
 // runGitInDir runs a git command in the given directory and returns stdout+stderr.
 func runGitInDir(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return string(out), err
-}
-
-// buildBillBrief composes the markdown brief that is injected into the Minister's chamber.
-func buildBillBrief(minister *store.Minister, bill *store.Bill, branch string) string {
-	var skills []string
-	if minister.Skills != "" {
-		_ = json.Unmarshal([]byte(minister.Skills), &skills)
-	}
-	skillsStr := strings.Join(skills, ", ")
-	if skillsStr == "" {
-		skillsStr = "通用"
-	}
-
-	motion := bill.Description.String
-	if motion == "" {
-		motion = bill.Title
-	}
-
-	today := time.Now().Format("2006-01-02")
-
-	return fmt.Sprintf(`# 部长就职简报
-
-> **你是 %s**（ID: `+"`%s`"+`），一位 AI Agent。
-> 你正在 House of Cards 多 Agent 协作框架中工作。
-> 技能领域：%s
-
----
-
-## 你的议案（Bill）
-
-| 字段 | 值 |
-|------|----|
-| **议案 ID** | `+"`%s`"+` |
-| **标题** | %s |
-| **状态** | %s → In Progress |
-| **工作分支** | `+"`%s`"+` |
-| **日期** | %s |
-
-## 任务指示（Motion）
-
-%s
-
----
-
-## 工作规范
-
-1. 你正在 **git worktree（议事厅）** 中工作，分支为 `+"`%s`"+`，已与 main 分离。
-2. 专注完成上述议案，不要做额外的事情。
-3. 完成后，**在当前目录的 `+"`gazettes/%s.md`"+` 中创建公报**（见模板）。
-4. 提交所有代码：
-
-   `+"`"+`git add -A && git commit -m "bill(%s): %s"`+"`"+`
-
-5. **最后一步（必须执行）**：写入完成信号文件，让 Whip 自动将议案标记为 enacted：
-
-   `+"```bash"+`
-   mkdir -p .hoc
-   echo "工作已完成。[简短摘要]" > .hoc/bill-%s.done
-   `+"```"+`
-
----
-
-## 完成后公报模板
-
-将以下内容写入 `+"`gazettes/%s.md`"+`：
-
-`+"```markdown"+`
-# Gazette: %s
-> From: %s | Bill: %s | Date: %s
-
-## 决议
-[3 句话以内描述你完成了什么]
-
-## 变更清单
-- `+"`file/path`"+` — 说明
-
-## 接口契约（下游部长需要知道的）
-[如有 API/接口，列出这里；否则写"无"]
-
-## 假设与风险
-[列出关键假设；否则写"无"]
-
-## 状态
-✅ Enacted | 测试通过 | 分支: %s
-`+"```"+`
-
----
-
-*议案已就绪，请开始工作。*
-`,
-		minister.Title,
-		minister.ID,
-		skillsStr,
-		bill.ID,
-		bill.Title,
-		bill.Status,
-		branch,
-		today,
-		motion,
-		branch,
-		bill.ID,
-		bill.ID,
-		bill.ID,
-		bill.ID, // done file: .hoc/bill-%s.done
-		bill.Title,
-		bill.ID,
-		minister.Title,
-		bill.ID,
-		today,
-		branch,
-	)
-}
-
-// buildMinisterCLAUDE creates the CLAUDE.md file content for a minister's chamber.
-// This file provides the minister with instructions on how to complete work and interact
-// with the Gazette ACK protocol.
-func buildMinisterCLAUDE(minister *store.Minister, bill *store.Bill, branch string) string {
-	today := time.Now().Format("2006-01-02")
-
-	return fmt.Sprintf(`# CLAUDE.md — Minister 工作规范
-
-> 这是 House of Cards 多 Agent 协作框架的工作规范。
-> 请仔细阅读并遵循。
-
----
-
-## 当前任务
-
-- **议案 ID**: `+"`%s`"+`
-- **标题**: %s
-- **工作分支**: `+"`%s`"+`
-- **日期**: %s
-
----
-
-## 必须完成的工作
-
-1. 专注完成上述议案，不要做额外的事情
-2. 提交所有代码变更
-
----
-
-## 完成信号（必须）
-
-完成工作后，你**必须**写入完成信号文件：
-
-`+"```bash"+`
-mkdir -p .hoc
-cat > .hoc/bill-%s.done << 'EOF'
-summary = "简要描述完成的工作（1-2句话）"
-
-[contracts]
-# 下游部长需要知道的接口/契约
-# 例如: "api.go" = "新增 UserService 接口"
-"example.go" = "描述"
-
-[artifacts]
-# 新增或修改的文件
-# 例如: "internal/handler.go" = "新增"
-"file.go" = "新增/修改"
-
-[assumptions]
-# 关键假设或风险
-# 例如: "api-version" = "假设下游使用 v2 API"
-key = "assumption"
-EOF
-`+"```"+`
-
-**重要**：
-- 必须使用 **TOML 格式**（如上所示）
-- 必须写入 `+"`.hoc/bill-{bill-id}.done`"+` 文件
-- Whip 会自动检测此文件并将议案标记为 enacted
-
----
-
-## 公报模板
-
-完成工作后，请在 `+"`gazettes/%s.md`"+` 创建公报：
-
-`+"```markdown"+`
-# Gazette: completion
-> From: %s | Bill: %s | Date: %s
-
-## 决议
-[3 句话以内描述你完成了什么]
-
-## 变更清单
-- `+"`file/path`"+` — 说明
-
-## 接口契约（下游部长需要知道的）
-[如有 API/接口，列出这里；否则写"无"]
-
-## 假设与风险
-[列出关键假设；否则写"无"]
-
-## 状态
-✅ Enacted | 测试通过 | 分支: %s
-`+"```"+`
-
----
-
-## 公报签收协议（ACK Protocol）
-
-当你的议案有下游依赖者时：
-1. 你的完成公报会被投递到下游部长的 inbox
-2. 下游部长会读取你的公报并确认（ACK）
-3. 只有当**所有下游**都 ACK 后，你才会变为 idle 状态
-
-**禁止直接 push main 分支** — 所有变更通过 Gazette 传递。
-
----
-
-## 质询机制（Question Time）
-
-如果下游部长对你的工作有疑问：
-1. 他们会创建 `+"`.hoc/bill-{id}.question`"+` 文件
-2. 你需要创建 `+"`.hoc/bill-{id}.answer`"+` 文件回复
-3. 最多 3 轮问答，超时后会自动升级
-
----
-
-*请开始工作。*
-`,
-		bill.ID,
-		bill.Title,
-		branch,
-		today,
-		bill.ID,
-		bill.ID,
-		minister.Title,
-		bill.ID,
-		today,
-		branch,
-	)
-}
-
-// formatUpstreamGazette renders a single upstream gazette with structured payload if available.
-func formatUpstreamGazette(g *store.Gazette) string {
-	if g.Payload != "" {
-		var p store.DoneFilePayload
-		if err := json.Unmarshal([]byte(g.Payload), &p); err == nil &&
-			(p.Summary != "" || len(p.Contracts) > 0 || len(p.Artifacts) > 0 || len(p.Assumptions) > 0) {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("**[%s]** %s:\n\n", g.Type.String, orDash(g.FromMinister.String)))
-			if p.Summary != "" {
-				sb.WriteString(fmt.Sprintf("**摘要**: %s\n", p.Summary))
-			}
-			if len(p.Contracts) > 0 {
-				sb.WriteString("**接口契约**:\n")
-				for k, v := range p.Contracts {
-					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
-				}
-			}
-			if len(p.Artifacts) > 0 {
-				sb.WriteString("**产出物**:\n")
-				for k, v := range p.Artifacts {
-					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
-				}
-			}
-			if len(p.Assumptions) > 0 {
-				sb.WriteString("**假设**:\n")
-				for k, v := range p.Assumptions {
-					sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
-				}
-			}
-			return sb.String()
-		}
-	}
-	return fmt.Sprintf("**[%s]** %s:\n\n%s\n\n", g.Type.String, orDash(g.FromMinister.String), g.Summary)
 }
 
 // ─── Phase 3B: Minister Hook Queue Commands ───────────────────────────────────

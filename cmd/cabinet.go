@@ -213,7 +213,8 @@ var cabinetReshuffleCmd = &cobra.Command{
 				Summary: fmt.Sprintf("内阁改组令：议案 [%s] \"%s\" 派发给 %s。\n请运行: hoc minister summon %s --bill %s --project <project>",
 					a.bill.ID, a.bill.Title, a.minister.Title, a.minister.ID, a.bill.ID),
 			}
-			_ = db.CreateGazette(g)
+			warnIfErr("create gazette", db.CreateGazette(g), "gazette_id", g.ID,
+				"minister_id", a.minister.ID, "bill_id", a.bill.ID)
 
 			fmt.Printf("  ✓ 议案 [%s] → %s\n", a.bill.ID, a.minister.Title)
 		}

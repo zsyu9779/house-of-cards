@@ -34,6 +34,11 @@ type Whip struct {
 	hocDir string
 	tracer *otel.Tracer
 	cfg    *config.Config
+
+	// lastContextAlert records the last time we alerted a given minister about
+	// context-window exhaustion, so tick() does not re-send the same warning on
+	// every 10-second cycle. Key is minister ID.
+	lastContextAlert map[string]time.Time
 }
 
 // whipMetrics is a convenience bundle of OTEL counters/histograms used by Whip.
@@ -59,10 +64,11 @@ func New(db *store.DB, hocDir string, cfgs ...*config.Config) *Whip {
 	}
 
 	return &Whip{
-		db:     db,
-		hocDir: hocDir,
-		tracer: otel.GlobalTracer("whip"),
-		cfg:    cfg,
+		db:               db,
+		hocDir:           hocDir,
+		tracer:           otel.GlobalTracer("whip"),
+		cfg:              cfg,
+		lastContextAlert: make(map[string]time.Time),
 	}
 }
 
@@ -106,6 +112,7 @@ func (w *Whip) tick() {
 	w.pollAckFiles()             // Phase 2: ACK protocol
 	w.pollIdleMinisterReassign() // Phase 3B: Hook queue auto-reassign
 	w.committeeAutomation()
+	w.checkContextHealth()
 	w.gazetteDispatch()
 	w.autoscale()
 }

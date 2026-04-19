@@ -213,6 +213,21 @@ var doctorCmd = &cobra.Command{
 			}
 		}
 
+		// ── 8. Observability exporter (OTLP stub check) ──────────
+		fmt.Print("  可观测性导出器   ... ")
+		switch cfg.Observability.Exporter {
+		case "stdout":
+			fmt.Println("✅  stdout")
+		case "otlp":
+			fmt.Println("⚠   otlp 为 stub，v0.3 暂未实现（spans 会被丢弃）— 建议使用 stdout 或 nop")
+			allOK = false
+		case "nop", "":
+			fmt.Println("ℹ   nop（已禁用）")
+		default:
+			fmt.Printf("⚠   未知导出器 %q\n", cfg.Observability.Exporter)
+			allOK = false
+		}
+
 		// ── Summary ──────────────────────────────────────────────
 		fmt.Println(repeat("─", 50))
 		if fixMode && fixCount > 0 {
