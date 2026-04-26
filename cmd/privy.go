@@ -51,7 +51,7 @@ var privyMergeCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sessionID := args[0]
 		projectName, _ := cmd.Flags().GetString("project")

@@ -103,7 +103,7 @@ var ministerAppointCmd = &cobra.Command{
 			slog.Error("init db", "err", err)
 			os.Exit(1)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		rt, _ := cmd.Flags().GetString("runtime")
 		portfolio, _ := cmd.Flags().GetStringSlice("portfolio")
@@ -147,7 +147,7 @@ var ministerSummonCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		billID, _ := cmd.Flags().GetString("bill")
@@ -221,7 +221,7 @@ var ministerDismissCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		minister, err := db.GetMinister(ministerID)
@@ -230,7 +230,7 @@ var ministerDismissCmd = &cobra.Command{
 		}
 
 		if minister.Status == "offline" {
-			return fmt.Errorf("Minister [%s] 已处于 offline 状态", ministerID)
+			return fmt.Errorf("minister [%s] 已处于 offline 状态", ministerID)
 		}
 
 		confirm, _ := cmd.Flags().GetBool("confirm")
@@ -275,7 +275,7 @@ var ministersListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministers, err := db.ListMinisters()
 		if err != nil {
@@ -354,7 +354,7 @@ var ministerByElectionCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		m, err := db.GetMinister(ministerID)
@@ -444,7 +444,7 @@ var ministerRecoverCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		m, err := db.GetMinister(ministerID)
@@ -497,7 +497,7 @@ var ministerAutoCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sessionFilter, _ := cmd.Flags().GetString("session")
 		defaultProject, _ := cmd.Flags().GetString("project")
@@ -648,7 +648,7 @@ var ministerHookPushCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		billID := args[1]
@@ -681,7 +681,7 @@ var ministerHookListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		queue, err := db.PeekHook(ministerID)
@@ -718,7 +718,7 @@ var ministerHookPopCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerID := args[0]
 		billID, err := db.PopHook(ministerID)

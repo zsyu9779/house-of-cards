@@ -567,7 +567,7 @@ var floorCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		intervalSec, _ := cmd.Flags().GetInt("interval")
 		interval := time.Duration(intervalSec) * time.Second

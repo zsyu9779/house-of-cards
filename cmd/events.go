@@ -35,7 +35,7 @@ var eventsListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		topic, _ := cmd.Flags().GetString("topic")
 		billID, _ := cmd.Flags().GetString("bill")
@@ -98,7 +98,7 @@ var eventsTimelineCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sessionID := args[0]
 

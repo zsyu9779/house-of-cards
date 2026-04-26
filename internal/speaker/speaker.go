@@ -215,6 +215,7 @@ func writePatrolPrompt(path, contextContent string) error {
 	path = filepath.Clean(path)
 	return os.WriteFile(path, []byte(content), 0644)
 }
+
 // SummonResult carries the outcome of a Speaker summon for the CLI caller.
 // TmuxSession is the tmux session name when the speaker was started in
 // detached mode; it is empty for interactive (foreground) runs.

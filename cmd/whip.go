@@ -52,7 +52,7 @@ var whipStartCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		// Write PID file.
 		pidFile := whipPIDFile()
@@ -125,7 +125,7 @@ var whipReportCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		// Show daemon status.
 		pidFile := whipPIDFile()

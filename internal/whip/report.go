@@ -112,9 +112,10 @@ func Report(db *store.DB, showHistory bool) (string, error) {
 	sb.WriteString(fmt.Sprintf("\n📋 会期 (Sessions): %d 活跃 / %d 总计\n", len(sessions), len(allSessions)))
 	for _, s := range allSessions {
 		icon := "🟢"
-		if s.Status == "completed" {
+		switch s.Status {
+		case "completed":
 			icon = "✅"
-		} else if s.Status == "dissolved" {
+		case "dissolved":
 			icon = "⚫"
 		}
 		sb.WriteString(fmt.Sprintf("  %s [%s] %s\n", icon, s.Status, s.Title))

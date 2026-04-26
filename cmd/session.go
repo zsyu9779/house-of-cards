@@ -95,7 +95,7 @@ var sessionOpenCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		// Resolve file path.
 		specPath := args[0]
@@ -244,7 +244,7 @@ var sessionStatusCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		jsonMode, _ := cmd.Flags().GetBool("json")
 
@@ -322,9 +322,10 @@ func showSessionDetail(sessionID string, jsonMode bool) error {
 	}
 
 	statusIcon := "🟢"
-	if s.Status == "completed" {
+	switch s.Status {
+	case "completed":
 		statusIcon = "✅"
-	} else if s.Status == "dissolved" {
+	case "dissolved":
 		statusIcon = "⚫"
 	}
 	projStr := ""
@@ -454,7 +455,7 @@ var sessionDissolveCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sid := args[0]
 		s, err := db.GetSession(sid)
@@ -529,7 +530,7 @@ var sessionStatsCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		allMode, _ := cmd.Flags().GetBool("all")
 
@@ -644,7 +645,7 @@ var sessionPauseCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sid := args[0]
 		reason, _ := cmd.Flags().GetString("reason")
@@ -683,7 +684,7 @@ var sessionResumeCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sid := args[0]
 		s, err := db.GetSession(sid)
@@ -715,7 +716,7 @@ var sessionAdvanceCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sid := args[0]
 		force, _ := cmd.Flags().GetBool("force")
@@ -772,7 +773,7 @@ var sessionReplayCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		sid := args[0]
 		s, err := db.GetSession(sid)
@@ -1003,7 +1004,7 @@ var sessionMigrateCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		defaultProject, _ := cmd.Flags().GetString("project")
 		confirm, _ := cmd.Flags().GetBool("confirm")

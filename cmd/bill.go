@@ -64,7 +64,7 @@ var billListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		bills, err := db.ListBills()
 		if err != nil {
@@ -132,7 +132,7 @@ var billShowCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		b, err := db.GetBill(args[0])
 		if err != nil {
@@ -188,7 +188,7 @@ var billDraftCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		title, _ := cmd.Flags().GetString("title")
 		sessionID, _ := cmd.Flags().GetString("session")
@@ -238,7 +238,7 @@ var billAssignCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		ministerID := args[1]
@@ -306,7 +306,7 @@ var billEnactedCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		quality, _ := cmd.Flags().GetFloat64("quality")
@@ -377,7 +377,7 @@ var billCommitteeCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		b, err := db.GetBill(billID)
@@ -426,7 +426,7 @@ var billReviewCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		pass, _ := cmd.Flags().GetBool("pass")
@@ -533,7 +533,7 @@ var billPauseCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		reason, _ := cmd.Flags().GetString("reason")
@@ -588,7 +588,7 @@ var billResumeCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		b, err := db.GetBill(billID)
@@ -622,7 +622,7 @@ var billSplitCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		billID := args[0]
 		subTitles, _ := cmd.Flags().GetStringSlice("into")

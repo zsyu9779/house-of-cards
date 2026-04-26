@@ -18,7 +18,7 @@ var hansardCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		if len(args) > 0 {
 			return showMinisterHansard(args[0])
@@ -43,7 +43,7 @@ var hansardListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		return listAllHansard()
 	},
 }
@@ -159,7 +159,7 @@ var hansardTrendCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		lastN, _ := cmd.Flags().GetInt("last")
 		return showHansardTrend(lastN)
@@ -225,7 +225,7 @@ var hansardScoreCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		return showHansardScore()
 	},
 }
@@ -350,7 +350,7 @@ var hansardMetricsCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		fmt.Println("📊 质询度量 (Question Time Metrics)")
 		fmt.Println("═══════════════════════════════════")

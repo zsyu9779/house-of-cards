@@ -46,7 +46,7 @@ func NewDB(homeDir string) (*DB, error) {
 
 	db := &DB{conn: conn, path: dbPath}
 	if err := db.migrate(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 

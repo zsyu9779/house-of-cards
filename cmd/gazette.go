@@ -36,7 +36,7 @@ var gazetteListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministerFilter, _ := cmd.Flags().GetString("minister")
 		billFilter, _ := cmd.Flags().GetString("bill")
@@ -101,7 +101,7 @@ var gazetteShowCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		// Fetch all and find by ID prefix.
 		gs, err := db.ListGazettes()

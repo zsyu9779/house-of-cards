@@ -36,7 +36,7 @@ var cabinetListCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		ministers, err := db.ListMinisters()
 		if err != nil {
@@ -108,7 +108,7 @@ var cabinetReshuffleCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		confirm, _ := cmd.Flags().GetBool("confirm")
 		maxPerMinister, _ := cmd.Flags().GetInt("max-per-minister")

@@ -57,7 +57,7 @@ var speakerSummonCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		noTmux, _ := cmd.Flags().GetBool("no-tmux")
 
@@ -94,7 +94,7 @@ var speakerContextCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		refresh, _ := cmd.Flags().GetBool("refresh")
 
@@ -143,7 +143,7 @@ var speakerPatrolCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		intervalSec, _ := cmd.Flags().GetInt("interval")
 		once, _ := cmd.Flags().GetBool("once")
@@ -351,7 +351,7 @@ var speakerCouncilCmd = &cobra.Command{
 		if err := initDB(); err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		goal, _ := cmd.Flags().GetString("goal")
 		if goal == "" {

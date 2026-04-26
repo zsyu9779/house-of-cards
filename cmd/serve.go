@@ -88,7 +88,7 @@ API 端点：
 			return fmt.Errorf("server shutdown: %w", err)
 		}
 
-		db.Close()
+		_ = db.Close()
 		fmt.Println("✓ 服务器已关闭")
 		return nil
 	},

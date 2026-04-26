@@ -25,6 +25,7 @@ linters:
         - fmt.Fprintln
         - fmt.Printf
         - fmt.Println
+        - Close
     gosec:
       excludes:
         # G104: unhandled errors — deferred to E-1 error governance.
@@ -36,6 +37,8 @@ linters:
         - G306
         # G202: SQL string concatenation — IN clause placeholders are safe.
         - G202
+        # G703: path traversal — filepath.Clean is applied before use.
+        - G703
       severity: high
       confidence: medium
     gocritic:
@@ -57,4 +60,7 @@ linters:
       - path: _test\.go
         linters:
           - exhaustive
-
+      # QF1012: "Use fmt.Fprintf instead of WriteString(fmt.Sprintf)" — style preference.
+      - linters:
+          - staticcheck
+        text: "QF1012"
